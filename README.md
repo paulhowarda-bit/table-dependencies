@@ -191,6 +191,33 @@ The CLI is a thin wrapper; everything it does is importable.
 pip install -e .        # or just run from the repo root without installing
 ```
 
+### Vendoring into another project's `src/`
+
+To drop mfdep into another project as a copied-in package (rather than a pip
+dependency), copy the **contents of the `mfdep/` package folder** into a
+package dir on that project's import path — e.g. `<project>/src/mfdep/`:
+
+```
+table-dependencies/mfdep/*   ->   <project>/src/mfdep/*      # __init__.py at src/mfdep/__init__.py
+```
+
+Copy the `.py` files (skip `__pycache__`). Do **not** copy the whole repo into
+`src/mfdep/` — the package is the inner `mfdep/` folder; the repo root's
+`mfdep.py` launcher, `pyproject.toml` and `tests/` are not part of it. The
+package is self-contained: `mfdep/__main__.py` makes `python -m mfdep` work
+without the root launcher, and every import inside the package is relative.
+
+`import mfdep` then resolves to that copy once `src/` is on the path (a
+src-layout project makes it so via `pip install -e .`). Confirm nothing else
+shadows it:
+
+```bash
+python -c "import mfdep; print(mfdep.__file__)"   # must print <project>/src/mfdep/__init__.py
+```
+
+If it prints a site-packages path instead, a separately-installed mfdep is
+winning — `pip uninstall mfdep` so only the vendored copy is found.
+
 ```python
 import mfdep
 

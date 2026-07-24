@@ -23,13 +23,42 @@ Two rules make "test here, run at work" work cleanly:
 from __future__ import annotations
 
 import os
-from typing import Any, Dict, Optional
+import sys
+from pathlib import Path
+from typing import Any, Dict
 
-import mfdep
+
+def _ensure_src_on_path() -> None:
+    """Make ``import mfdep`` work straight from a download, with no install.
+
+    Tries a normal import first, so a pip-installed mfdep (or an already
+    configured path) wins and this does nothing. Only when that fails does it
+    walk up from this file to the directory that holds the vendored ``mfdep/``
+    package and put it on ``sys.path``. That directory is the project's ``src``
+    root, so the same step also makes ``network_drive`` and the rest of the
+    project importable - one bootstrap, zero setup, independent of the current
+    working directory.
+    """
+    try:
+        import mfdep  # noqa: F401
+        return
+    except ImportError:
+        pass
+    for parent in Path(__file__).resolve().parents:
+        if (parent / "mfdep" / "__init__.py").is_file():
+            sys.path.insert(0, str(parent))
+            return
+    # Not found beside us; the import below raises a clear ImportError.
+
+
+_ensure_src_on_path()
+
+import mfdep  # noqa: E402 - deliberately after the path bootstrap
 
 try:
     # At work: the dedicated network-share package owns the db location, so a
-    # move of the share is a one-line change there, not here.
+    # move of the share is a one-line change there, not here. (Importable via
+    # the same src root the bootstrap above put on the path.)
     from network_drive import DB_DIR
 
     MFDEP_DB_PATH: str = str(DB_DIR / "mfdep.db")

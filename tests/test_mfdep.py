@@ -673,6 +673,68 @@ class TestLoggingSetup(unittest.TestCase):
         self.assertEqual(out.decode().strip(), "1")
 
 
+class TestZeroInstallConsumer(unittest.TestCase):
+    """"Download and run": the integration template must find both mfdep and
+    network_drive with no install and nothing on PYTHONPATH, by self-locating
+    the vendored packages from its own file position.
+
+    The subprocess runs with -S -E (no site-packages, ignore PYTHON* env), so a
+    separately pip-installed mfdep cannot mask the bootstrap - the only mfdep
+    reachable is the vendored copy the template must find on its own.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        build()
+        cls.tmp = tempfile.mkdtemp()
+        src = os.path.join(cls.tmp, "src")
+        os.makedirs(os.path.join(src, "network_drive", "db"))
+        os.makedirs(os.path.join(src, "tracer_agent"))
+        repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # Vendor the package and drop the template in as the consumer.
+        shutil.copytree(os.path.join(repo, "mfdep"), os.path.join(src, "mfdep"),
+                        ignore=shutil.ignore_patterns("__pycache__"))
+        shutil.copy(
+            os.path.join(repo, "integration", "table_dependencies.py"),
+            os.path.join(src, "tracer_agent", "table_dependencies.py"))
+        with open(os.path.join(src, "network_drive", "__init__.py"), "w") as fh:
+            fh.write('from pathlib import Path\n'
+                     'DB_DIR = Path(__file__).parent / "db"\n')
+        run_index(ScanOptions(
+            roots=[ROOT], quiet=True, full=True,
+            db_path=os.path.join(src, "network_drive", "db", "mfdep.db")))
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_consumer_finds_mfdep_with_no_setup(self):
+        runner = os.path.join(self.tmp, "run.py")
+        with open(runner, "w") as fh:
+            fh.write(
+                "import importlib.util, os\n"
+                "p = os.path.join('src', 'tracer_agent', 'table_dependencies.py')\n"
+                "spec = importlib.util.spec_from_file_location('td', p)\n"
+                "m = importlib.util.module_from_spec(spec)\n"
+                "spec.loader.exec_module(m)\n"          # runs the self-bootstrap
+                "s = m.table_dependency_summary('PRODDB.CUSTOMER')\n"
+                "print(m.MFDEP_DB_PATH.replace(os.sep, '/'))\n"
+                "print(s['references'], len(s['jobs']))\n")
+
+        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        out = subprocess.check_output(
+            [sys.executable, "-S", "-E", "run.py"],
+            cwd=self.tmp, env=env, text=True).strip().splitlines()
+
+        db_path, counts = out[0], out[1]
+        # network_drive lives ONLY in the temp src (never installed), so its use
+        # proves the bootstrap put src/ on the path with zero setup.
+        self.assertTrue(db_path.endswith("network_drive/db/mfdep.db"), db_path)
+        refs, jobs = (int(x) for x in counts.split())
+        self.assertGreater(refs, 0)
+        self.assertGreater(jobs, 0)
+
+
 class TestLargeFile(unittest.TestCase):
     """A member far larger than the chunk threshold must still parse."""
 

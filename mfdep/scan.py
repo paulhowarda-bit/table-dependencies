@@ -172,21 +172,40 @@ def run_index(opts: ScanOptions) -> dict:
         bulk = total >= BULK_LOAD_FILES
         if bulk:
             store.drop_indexes()
-        say(f"Parsing {total:,} files with {workers} workers...")
-        with ProcessPoolExecutor(max_workers=workers) as pool:
-            for facts in pool.map(_worker, jobs, chunksize=opts.chunksize):
+        def progress() -> None:
+            if opts.quiet or done % 200:
+                return
+            elapsed = max(time.time() - t0, 0.001)
+            rate = done / elapsed
+            eta = (total - done) / rate if rate else 0
+            print(f"\r  {done:,}/{total:,}  {rate:,.0f} files/s  "
+                  f"{bytes_done / 1e6:,.0f} MB  ETA {eta / 60:,.1f}m  "
+                  f"errors {errors}", end="", file=sys.stderr, flush=True)
+
+        if workers == 1:
+            # Serial, in-process: no pool, so an embedding caller needs no
+            # __main__ guard. On Windows the pool spawns by re-importing the
+            # calling module, and a library user without that guard would have
+            # every worker re-run their script and spawn its own workers.
+            say(f"Parsing {total:,} files serially (workers=1)...")
+            results = map(_worker, jobs)
+        else:
+            say(f"Parsing {total:,} files with {workers} workers...")
+            pool = ProcessPoolExecutor(max_workers=workers)
+            results = pool.map(_worker, jobs, chunksize=opts.chunksize)
+
+        try:
+            for facts in results:
                 store.add(facts)
                 done += 1
                 bytes_done += facts.size
                 if facts.error:
                     errors += 1
-                if not opts.quiet and done % 200 == 0:
-                    elapsed = max(time.time() - t0, 0.001)
-                    rate = done / elapsed
-                    eta = (total - done) / rate if rate else 0
-                    print(f"\r  {done:,}/{total:,}  {rate:,.0f} files/s  "
-                          f"{bytes_done / 1e6:,.0f} MB  ETA {eta / 60:,.1f}m  "
-                          f"errors {errors}", end="", file=sys.stderr, flush=True)
+                progress()
+        finally:
+            if workers != 1:
+                pool.shutdown()
+
         if not opts.quiet:
             print(file=sys.stderr)
 

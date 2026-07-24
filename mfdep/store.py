@@ -296,6 +296,12 @@ class Store:
         self.flush()
         self.conn.close()
 
+    def __enter__(self) -> "Store":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     # ------------------------------------------------------------ stats
 
     def stats(self) -> dict[str, int]:

@@ -9,3 +9,7 @@ out.csv
 out.json
 impact.csv
 .claude/
+
+*.egg-info/
+build/
+dist/

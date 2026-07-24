@@ -442,6 +442,89 @@ class TestUnresolvedCalls(unittest.TestCase):
         self.assertEqual(set(self.res.programs), {"CICSCUST"})
 
 
+class TestLibraryApi(unittest.TestCase):
+    """The public surface another program imports."""
+
+    @classmethod
+    def setUpClass(cls):
+        build()
+        cls.tmp = tempfile.mkdtemp()
+        cls.db = os.path.join(cls.tmp, "api.db")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_serial_mode_needs_no_process_pool(self):
+        """workers=1 must parse in-process, so an embedding caller without a
+        __main__ guard is not required to have one on Windows."""
+        import mfdep
+        stats = mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        self.assertGreater(stats["files"], 0)
+        self.assertGreater(stats["table_refs"], 0)
+
+    def test_index_accepts_a_bare_path_not_just_a_list(self):
+        import mfdep
+        stats = mfdep.index(ROOT, db=os.path.join(self.tmp, "b.db"), workers=1)
+        self.assertGreater(stats["files"], 0)
+
+    def test_query_returns_usable_objects(self):
+        import mfdep
+        mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        res = mfdep.query("PRODDB.CUSTOMER", db=self.db)
+        self.assertTrue(res.refs)
+        self.assertTrue(any(r.access == "WRITE" for r in res.refs))
+        self.assertIn("CUSTJOB1", res.jobs)
+        first = res.refs[0]
+        for attr in ("path", "member", "line", "schema", "table", "access"):
+            self.assertTrue(hasattr(first, attr), attr)
+
+    def test_query_accepts_an_open_store(self):
+        import mfdep
+        mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        with mfdep.open_index(self.db) as store:
+            a = mfdep.query("PRODDB.CUSTOMER", db=store)
+            b = mfdep.query("PRODDB.CUST_AUDIT", db=store)
+        self.assertTrue(a.refs)
+        self.assertTrue(b.refs)
+
+    def test_open_index_refuses_a_missing_file(self):
+        """Silently creating an empty index would report that nothing depends
+        on the table, which is the most dangerous possible wrong answer."""
+        import mfdep
+        with self.assertRaises(FileNotFoundError):
+            mfdep.open_index(os.path.join(self.tmp, "nope.db"))
+
+    def test_store_is_a_context_manager(self):
+        import mfdep
+        mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        with mfdep.open_index(self.db) as store:
+            self.assertTrue(store.stats()["files"] > 0)
+
+    def test_tables_listing(self):
+        import mfdep
+        mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        rows = mfdep.tables(db=self.db, like="CUST%")
+        self.assertTrue(rows)
+        self.assertEqual(set(rows[0]) & {"schema", "table_name", "refs"},
+                         {"schema", "table_name", "refs"})
+
+    def test_index_is_queryable_as_plain_sqlite(self):
+        """Documented escape hatch for questions the API does not cover."""
+        import mfdep
+        mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        with mfdep.open_index(self.db) as store:
+            row = store.conn.execute(
+                "SELECT COUNT(*) c FROM table_refs WHERE access='WRITE'").fetchone()
+        self.assertGreater(row["c"], 0)
+
+    def test_top_level_exports(self):
+        import mfdep
+        for name in ("index", "query", "open_index", "tables", "Result",
+                     "Store", "Analyzer"):
+            self.assertTrue(hasattr(mfdep, name), name)
+
+
 class TestLargeFile(unittest.TestCase):
     """A member far larger than the chunk threshold must still parse."""
 

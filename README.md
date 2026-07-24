@@ -4,11 +4,22 @@ Finds every dependency of a DB2 table across 50,000–100,000 exported mainframe
 artifacts on a network drive: JCL, PROCs, COBOL, copybooks, DCLGENs, control
 cards and stored procedures.
 
-Pure Python 3.9+ standard library. Nothing to install.
+Pure Python 3.9+ standard library — no dependencies, and nothing needs
+installing to use it.
 
 ```bash
 python mfdep.py index \\fileserv\mfarchive\PROD --db prod.db
 python mfdep.py query PRODDB.CUSTOMER --db prod.db --html cust.html
+```
+
+It is also a library. `pip install -e .` additionally puts an `mfdep` command
+on PATH and makes it importable from anywhere — see
+[Using it from Python](#using-it-from-python):
+
+```python
+import mfdep
+res = mfdep.query("PRODDB.CUSTOMER", db="prod.db")
+print(len(res.refs), "references,", len(res.jobs), "jobs at risk")
 ```
 
 ---
@@ -151,6 +162,84 @@ Useful `query` flags:
 
 ---
 
+## Using it from Python
+
+The CLI is a thin wrapper; everything it does is importable.
+
+```bash
+pip install -e .        # or just run from the repo root without installing
+```
+
+```python
+import mfdep
+
+if __name__ == "__main__":                       # see the note below
+    mfdep.index([r"\\fileserv\mfarchive\PROD"], db="prod.db")
+
+    res = mfdep.query("PRODDB.CUSTOMER", db="prod.db")
+    for r in res.refs:
+        print(r.access, r.stmt, f"{r.member}:{r.line}", r.path)
+
+    for job, steps in res.jobs.items():
+        print(job, [s.step for s in steps])
+
+    for path, line, kind, detail in res.blind_spots:
+        print("GAP", kind, path, line, detail)
+```
+
+| Call | Returns |
+|---|---|
+| `mfdep.index(roots, db=..., workers=, full=, include=, exclude=)` | dict of counts |
+| `mfdep.query(table, db=..., min_confidence=, include_read=, data_hops=)` | `Result` |
+| `mfdep.open_index(db)` | `Store`, usable as a context manager |
+| `mfdep.tables(db=..., like=, min_refs=)` | list of dicts |
+
+`Result` carries `.refs`, `.programs`, `.jobs`, `.steps`, `.data_links`,
+`.blind_spots`, `.notes`, `.targets` — all plain dataclasses. To reuse the
+formatters, `mfdep.report` has `text_report`, `csv_report`, `json_report` and
+`html_report`.
+
+**The `__main__` guard matters on Windows.** `index()` uses a process pool, and
+Windows spawns workers by re-importing the calling module — without the guard
+each worker re-runs your script's top level and spawns its own. If you are
+embedding mfdep somewhere that makes a guard awkward (a web request, a
+notebook, a module imported by something else), pass `workers=1` to parse
+in-process with no pool at all:
+
+```python
+import mfdep
+stats = mfdep.index("/mnt/mfarchive/PROD", db="prod.db", workers=1)
+```
+
+Reuse one open index when asking about many tables — reopening per call throws
+away the page cache:
+
+```python
+with mfdep.open_index("prod.db") as store:
+    for name in every_table:
+        res = mfdep.query(name, db=store)
+```
+
+`open_index` raises `FileNotFoundError` for a missing index rather than
+creating an empty one, because an empty index answers every question with
+"nothing depends on this table".
+
+**For anything the API doesn't cover, query the index directly** — it is a
+plain SQLite database and `store.conn` is a normal connection. The schema is
+documented in `store.py`; `table_refs`, `steps`, `dds`, `calls`, `copy_refs`
+and `objects` are the interesting tables.
+
+```python
+with mfdep.open_index("prod.db") as store:
+    rows = store.conn.execute("""
+        SELECT f.member, COUNT(*) n
+          FROM table_refs r JOIN files f ON f.id = r.file_id
+         WHERE r.access = 'WRITE' AND r.table_name = ?
+         GROUP BY 1 ORDER BY n DESC""", ("CUSTOMER",)).fetchall()
+```
+
+---
+
 ## Performance
 
 Measured on this machine (16 workers, local SSD, 20,000 files / 356 MB of
@@ -280,8 +369,10 @@ between the two lists is itself informative.
 ## Layout
 
 ```
-mfdep.py              launcher (multiprocessing entry point)
+pyproject.toml        packaging; `pip install -e .` gives an `mfdep` command
+mfdep.py              launcher, for running without installing
 mfdep/
+  api.py              library entry points: index/query/open_index/tables
   cli.py              argument parsing, subcommands
   scan.py             directory walk + process pool
   extract.py          per-file dispatch, chunked reads for large members

@@ -1,0 +1,11 @@
+*.db
+*.db-wal
+*.db-shm
+__pycache__/
+*.pyc
+tests/fixtures/
+out.html
+out.csv
+out.json
+impact.csv
+.claude/

@@ -33,22 +33,19 @@ __all__ = ["index", "query", "open_index", "tables", "Result", "Store", "Analyze
 
 def index(roots, db: str = "mfdep.db", *, workers: int = 0, full: bool = False,
           max_file_mb: int = 256, include=(), exclude=(), quiet: bool = True,
-          prune_missing: bool = True, timing: bool = False,
-          timing_sink=None) -> dict:
+          prune_missing: bool = True, timing: bool = False) -> dict:
     """Crawl ``roots`` and build (or incrementally refresh) the index at ``db``.
 
-    Returns a dict of counts: files, table_refs, steps, blind_spots, seconds...
+    Returns a dict of counts: files, table_refs, steps, blind_spots, seconds,
+    and ``"timing"`` - this run's per-stage wall-clock spans as
+    ``[{"stage": "walk", "ms": 12.3}, ...]`` in call order. The timings are
+    always returned; ``timing=True`` *additionally* logs the breakdown through
+    the ``mfdep`` logger (silent unless the host configured logging - see
+    mfdep.logging_setup), which is what the CLI ``--timing`` flag does.
 
     ``workers=1`` parses serially in the calling process, with no process pool.
     Use it when embedding mfdep somewhere a pool is awkward - inside a web
     request, a notebook, or any module without a ``__main__`` guard.
-
-    ``timing_sink`` collects this run's per-stage wall-clock spans: it is called
-    once, on completion, with ``[{"stage": "walk", "ms": 12.3}, ...]`` in call
-    order, so an embedding program can route them into its own timing log.
-    Supplying it turns collection on without touching stderr; ``timing=True``
-    additionally logs the breakdown through the ``mfdep`` logger (silent unless
-    the host configured logging - see mfdep.logging_setup).
     """
     if isinstance(roots, (str, os.PathLike)):
         roots = [roots]
@@ -56,22 +53,22 @@ def index(roots, db: str = "mfdep.db", *, workers: int = 0, full: bool = False,
         roots=[os.path.abspath(os.fspath(r)) for r in roots],
         db_path=os.fspath(db), workers=workers, full=full,
         max_file_mb=max_file_mb, include=tuple(include), exclude=tuple(exclude),
-        quiet=quiet, prune_missing=prune_missing, timing=timing,
-        timing_sink=timing_sink))
+        quiet=quiet, prune_missing=prune_missing, timing=timing))
 
 
 def query(table: str, db="mfdep.db", *, min_confidence: int = 0,
           include_read: bool = True, data_hops: int = 1,
-          vendor_file: str | None = None, timing: bool = False,
-          timing_sink=None) -> Result:
+          vendor_file: str | None = None, timing: bool = False) -> Result:
     """Return the full dependency :class:`~mfdep.graph.Result` for one table.
 
     ``db`` may be a path or an already-open :class:`Store`. Pass an open Store
     when asking about many tables - reopening it per call re-reads the SQLite
     header and throws away the page cache.
 
-    ``timing_sink`` collects this query's per-stage spans (targets, refs,
-    closure, jobs, data-trace, ...) the same way :func:`index` does.
+    The result's ``.timings`` attribute always holds this query's per-stage
+    spans (targets, refs, closure, jobs, data-trace, ...) as
+    ``[{"stage": ..., "ms": ...}, ...]``. ``timing=True`` additionally logs the
+    breakdown through the ``mfdep`` logger.
     """
     if vendor_file:
         load_overrides(vendor_file)
@@ -79,7 +76,7 @@ def query(table: str, db="mfdep.db", *, min_confidence: int = 0,
     def _run(store: Store) -> Result:
         return Analyzer(store).analyze(
             table, min_confidence=min_confidence, include_read=include_read,
-            data_hops=data_hops, timing=timing, timing_sink=timing_sink)
+            data_hops=data_hops, timing=timing)
 
     if isinstance(db, Store):
         return _run(db)

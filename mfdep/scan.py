@@ -47,10 +47,8 @@ class ScanOptions:
     full: bool = False
     prune_missing: bool = True
     quiet: bool = False
-    timing: bool = False        # log a per-stage wall-clock breakdown to stderr
-    # callable(rows) for a library caller's timing log; Any to avoid importing
-    # the profiling types into this module's signature.
-    timing_sink: "object | None" = None
+    timing: bool = False        # also log the per-stage breakdown to stderr;
+    # the timings are always collected and returned under result["timing"].
 
 
 @dataclass
@@ -113,7 +111,7 @@ def run_index(opts: ScanOptions) -> dict:
     started = time.time()
     workers = opts.workers or (os.cpu_count() or 4)
     max_bytes = opts.max_file_mb << 20
-    timer = StageTimer(_log, opts.timing, opts.db_path, sink=opts.timing_sink)
+    timer = StageTimer(_log, echo=opts.timing, source_name=opts.db_path)
 
     def bar(text: str, newline: bool = False) -> None:
         # A live \r progress line - terminal UI, not a log record. Shown only
@@ -238,4 +236,4 @@ def run_index(opts: ScanOptions) -> dict:
     _log.info(f"Indexed {done:,} files ({errors:,} unreadable) in {elapsed / 60:.1f}m")
     timer.report()
     return {"scanned": done, "skipped": skipped, "errors": errors,
-            "seconds": elapsed, **stats}
+            "seconds": elapsed, "timing": timer.timings(), **stats}

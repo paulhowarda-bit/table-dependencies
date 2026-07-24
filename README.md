@@ -261,20 +261,25 @@ with mfdep.open_index("prod.db") as store:
 
 ### Timing and logging
 
-`index()` and `query()` accept a `timing_sink` — a callable handed this run's
-per-stage spans, in call order, so a calling program can route them into its
-own timing log. Supplying it turns collection on without touching stderr:
+Both calls **return** their per-stage wall-clock spans — no flag, no callback.
+`index()` puts them in its result dict under `"timing"`; `query()` puts them on
+`Result.timings`. Each is `[{"stage": ..., "ms": ...}, ...]` in call order:
 
 ```python
-spans = []
-mfdep.index("/mnt/mfarchive/PROD", db="prod.db", workers=1,
-            timing_sink=spans.extend)
-# spans == [{"stage": "walk", "ms": 1840.5}, {"stage": "parse", "ms": 74213.9}, ...]
+stats = mfdep.index("/mnt/mfarchive/PROD", db="prod.db")
+for span in stats["timing"]:
+    print(span["stage"], span["ms"])
+# walk 1840.5 / plan 30.2 / prune 0.0 / clear 210.7 / parse 74213.9 / finalize 6120.4
+
+res = mfdep.query("PRODDB.CUSTOMER", db="prod.db")
+slowest = max(res.timings, key=lambda s: s["ms"])
 ```
 
-The sink is a diagnostic hook: if it raises, the exception is swallowed (logged
-as a warning) so a broken timing log never fails an index build or a query that
-already did its real work.
+They are always collected (the cost is a handful of `perf_counter` calls per
+call, not per file) and are diagnostic only — kept out of the CSV/JSON/HTML
+reports so those stay reproducible. Passing `timing=True` *additionally* logs
+the breakdown through the `mfdep` logger, which is what the CLI `--timing` flag
+turns on.
 
 The library **configures no logging of its own** — `import mfdep` attaches only
 a `NullHandler`, the documented contract for a well-behaved library, so it never
@@ -435,7 +440,7 @@ mfdep/
   store.py            SQLite schema and bulk-load write path
   graph.py            transitive closure  ← the "which jobs break" answer
   report.py           text / CSV / JSON / HTML
-  profiling.py        per-stage wall-clock timing (--timing / timing_sink)
+  profiling.py        per-stage wall-clock timing (returned + --timing echo)
   logging_setup.py    CLI-side logging; the library configures none
 tests/
   make_fixtures.py    generates a column-exact sample library

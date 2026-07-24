@@ -541,34 +541,21 @@ class _FakeLog:
 
 
 class TestStageTimer(unittest.TestCase):
-    """The timer is a no-op unless something consumes it, and never fails a run."""
+    """Collection is always on; ``echo`` only controls the stderr breakdown."""
 
-    def _timer(self, enabled, sink=None):
+    def _timer(self, echo):
         from mfdep.profiling import StageTimer
         self.log = _FakeLog()
-        return StageTimer(self.log, enabled, "src", sink=sink)
+        return StageTimer(self.log, echo=echo, source_name="src")
 
-    def test_disabled_collects_nothing(self):
+    def test_collects_regardless_of_echo(self):
         t = self._timer(False)
-        self.assertFalse(t.enabled)
         with t.stage("a"):
             pass
-        t.since("b", t.start())          # start() returns None when disabled
-        t.report()
-        self.assertEqual(t.timings(), [])
-        self.assertEqual(self.log.infos, [])
+        t.since("b", t.start())
+        self.assertEqual([r["stage"] for r in t.timings()], ["a", "b"])
 
-    def test_sink_turns_collection_on_without_the_flag(self):
-        seen = {}
-        t = self._timer(False, sink=lambda rows: seen.setdefault("rows", rows))
-        self.assertTrue(t.enabled)       # a sink is enough to enable
-        with t.stage("a"):
-            pass
-        t.report()
-        self.assertEqual([r["stage"] for r in seen["rows"]], ["a"])
-        self.assertEqual(self.log.infos, [])   # sink-only: no stderr echo
-
-    def test_stage_and_since_both_record_in_order(self):
+    def test_records_in_call_order_with_float_ms(self):
         t = self._timer(True)
         with t.stage("first"):
             pass
@@ -577,7 +564,14 @@ class TestStageTimer(unittest.TestCase):
         self.assertEqual([r["stage"] for r in rows], ["first", "second"])
         self.assertTrue(all(isinstance(r["ms"], float) for r in rows))
 
-    def test_echo_reports_through_the_log(self):
+    def test_echo_false_is_silent(self):
+        t = self._timer(False)
+        with t.stage("a"):
+            pass
+        t.report()
+        self.assertEqual(self.log.infos, [])   # values still collected, not logged
+
+    def test_echo_true_reports_with_measured_summary(self):
         t = self._timer(True)
         with t.stage("only"):
             pass
@@ -587,18 +581,9 @@ class TestStageTimer(unittest.TestCase):
         self.assertIn("only", joined)
         self.assertIn("measured", joined)      # summary line, not "total"
 
-    def test_sink_exception_never_fails_the_run(self):
-        def boom(_rows):
-            raise RuntimeError("sink is broken")
-        t = self._timer(True, sink=boom)
-        with t.stage("a"):
-            pass
-        t.report()                        # must not raise
-        self.assertTrue(any("sink is broken" in w for w in self.log.warnings))
-
 
 class TestTimingIntegration(unittest.TestCase):
-    """Timing threaded through the real index and query, via the library API."""
+    """Timing is returned by the library calls, not delivered by a callback."""
 
     @classmethod
     def setUpClass(cls):
@@ -610,42 +595,45 @@ class TestTimingIntegration(unittest.TestCase):
     def tearDownClass(cls):
         shutil.rmtree(cls.tmp, ignore_errors=True)
 
-    def test_index_sink_reports_its_stages(self):
+    def test_index_returns_timing_in_its_result(self):
         import mfdep
-        seen = {}
-        mfdep.index(ROOT, db=self.db, workers=1, full=True,
-                    timing_sink=lambda rows: seen.setdefault("rows", rows))
-        stages = [r["stage"] for r in seen["rows"]]
+        stats = mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        stages = [r["stage"] for r in stats["timing"]]
         self.assertEqual(stages, ["walk", "plan", "prune", "clear", "parse",
                                   "finalize"])
-        self.assertTrue(all(isinstance(r["ms"], float) for r in seen["rows"]))
+        self.assertTrue(all(isinstance(r["ms"], float) for r in stats["timing"]))
 
-    def test_query_sink_reports_its_stages(self):
+    def test_query_returns_timings_on_the_result(self):
         import mfdep
         mfdep.index(ROOT, db=self.db, workers=1, full=True)
-        seen = {}
-        mfdep.query("PRODDB.CUSTOMER", db=self.db,
-                    timing_sink=lambda rows: seen.setdefault("rows", rows))
-        stages = [r["stage"] for r in seen["rows"]]
+        res = mfdep.query("PRODDB.CUSTOMER", db=self.db)
+        stages = [r["stage"] for r in res.timings]
         self.assertEqual(stages, ["targets", "refs", "closure", "jobs",
                                   "data-trace", "unresolved-calls", "blind-spots"])
+
+    def test_timings_returned_without_asking(self):
+        """No flag needed - a Python caller always gets the numbers back."""
+        import mfdep
+        mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        res = mfdep.query("PRODDB.CUSTOMER", db=self.db)   # no timing= arg
+        self.assertTrue(res.timings)
+        self.assertIn("ms", res.timings[0])
 
     def test_timing_does_not_change_the_answer(self):
         """Timing is diagnostic: it must never alter the index or the result."""
         import mfdep
-        s_plain = mfdep.index(ROOT, db=os.path.join(self.tmp, "a.db"),
-                              workers=1, full=True)
-        s_timed = mfdep.index(ROOT, db=os.path.join(self.tmp, "b.db"),
-                              workers=1, full=True, timing_sink=lambda r: None)
-        self.assertEqual(s_plain["files"], s_timed["files"])
-        self.assertEqual(s_plain["table_refs"], s_timed["table_refs"])
+        s_a = mfdep.index(ROOT, db=os.path.join(self.tmp, "a.db"),
+                          workers=1, full=True)
+        s_b = mfdep.index(ROOT, db=os.path.join(self.tmp, "b.db"),
+                          workers=1, full=True, timing=True)
+        self.assertEqual(s_a["files"], s_b["files"])
+        self.assertEqual(s_a["table_refs"], s_b["table_refs"])
 
-        r_plain = mfdep.query("PRODDB.CUSTOMER", db=self.db)
-        r_timed = mfdep.query("PRODDB.CUSTOMER", db=self.db,
-                              timing_sink=lambda r: None)
-        self.assertEqual(len(r_plain.refs), len(r_timed.refs))
-        self.assertEqual(sorted(r_plain.jobs), sorted(r_timed.jobs))
-        self.assertEqual(len(r_plain.blind_spots), len(r_timed.blind_spots))
+        r_a = mfdep.query("PRODDB.CUSTOMER", db=self.db)
+        r_b = mfdep.query("PRODDB.CUSTOMER", db=self.db, timing=True)
+        self.assertEqual(len(r_a.refs), len(r_b.refs))
+        self.assertEqual(sorted(r_a.jobs), sorted(r_b.jobs))
+        self.assertEqual(len(r_a.blind_spots), len(r_b.blind_spots))
 
 
 class TestLoggingSetup(unittest.TestCase):

@@ -106,6 +106,9 @@ class Result:
     blind_spots: list[tuple[str, int, str, str]] = field(default_factory=list)
     notes: list[str] = field(default_factory=list)
     data_links: list[DataLink] = field(default_factory=list)
+    # per-stage wall-clock spans of this query, [{"stage","ms"}, ...], always
+    # populated; diagnostic only, so kept out of the CSV/JSON/HTML reports.
+    timings: list = field(default_factory=list)
 
 
 def _chunks(seq, n=400):
@@ -248,11 +251,11 @@ class Analyzer:
 
     def analyze(self, spec: str, min_confidence: int = 0,
                 include_read: bool = True, data_hops: int = 1,
-                timing: bool = False, timing_sink=None) -> Result:
+                timing: bool = False) -> Result:
         # start/since rather than `with` blocks: analyze() is one long method
         # whose phases already own their indentation, and wrapping each in a
         # context manager would force an awkward re-indent of the whole body.
-        timer = StageTimer(_log, timing, spec, sink=timing_sink)
+        timer = StageTimer(_log, echo=timing, source_name=spec)
 
         res = Result(spec=spec)
         _t = timer.start()
@@ -434,6 +437,7 @@ class Analyzer:
         timer.since("blind-spots", _t)
 
         timer.report()
+        res.timings = timer.timings()
         return res
 
     def _steps_from_direct_refs(self, seed_files, targets, min_confidence,

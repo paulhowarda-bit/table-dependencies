@@ -19,7 +19,14 @@ Pass ``workers=1`` to index() to parse in-process with no pool, which removes
 the __main__ requirement entirely - use that when embedding.
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
+
+import logging as _logging
+
+# A well-behaved library configures no logging of its own: attach a NullHandler
+# so `import mfdep` never touches a host application's logging, and only the CLI
+# (mfdep.logging_setup.configure_logging) ever installs a real handler.
+_logging.getLogger(__name__).addHandler(_logging.NullHandler())
 
 from .api import Analyzer, Result, Store, index, open_index, query, tables
 

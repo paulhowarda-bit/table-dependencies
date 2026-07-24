@@ -16,15 +16,19 @@ only ever selects from V_CUSTOMER is still reported as depending on CUSTOMER.
 
 from __future__ import annotations
 
+import logging
 import sqlite3
 from dataclasses import dataclass, field
 
 from .config import HEURISTIC, READ
+from .profiling import StageTimer
 from .store import Store
 from .util import display_path, dsn_path_score, split_qualified
 from .vendor import classify_module
 
 MAX_DEPTH = 12
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -243,14 +247,25 @@ class Analyzer:
         return ids
 
     def analyze(self, spec: str, min_confidence: int = 0,
-                include_read: bool = True, data_hops: int = 1) -> Result:
-        res = Result(spec=spec)
-        res.targets = self.resolve_targets(spec)
-        res.refs = self.refs_for(res.targets, min_confidence)
+                include_read: bool = True, data_hops: int = 1,
+                timing: bool = False, timing_sink=None) -> Result:
+        # start/since rather than `with` blocks: analyze() is one long method
+        # whose phases already own their indentation, and wrapping each in a
+        # context manager would force an awkward re-indent of the whole body.
+        timer = StageTimer(_log, timing, spec, sink=timing_sink)
 
+        res = Result(spec=spec)
+        _t = timer.start()
+        res.targets = self.resolve_targets(spec)
+        timer.since("targets", _t)
+
+        _t = timer.start()
+        res.refs = self.refs_for(res.targets, min_confidence)
         if not include_read:
             res.refs = [r for r in res.refs if r.access != READ]
+        timer.since("refs", _t)
 
+        _t_closure = timer.start()
         seed_files = self._file_ids_for_refs(res.targets, min_confidence)
 
         # ---- copybook / DCLGEN fan-out
@@ -321,8 +336,10 @@ class Analyzer:
             frontier_names = nxt
 
         res.programs = programs
+        timer.since("closure", _t_closure)
 
         # ---- JCL: steps running any of those programs, then PROC expansion
+        _t_jobs = timer.start()
         step_rows: list[StepNode] = []
         seen_steps: set[tuple[int, int]] = set()
         proc_frontier: set[str] = set()
@@ -398,12 +415,25 @@ class Analyzer:
 
         self.attach_datasets(res)
         self.attach_decks(res)
-        # extend, not assign: the deck resolver already recorded the references
-        # it could not confirm, and those must not be thrown away here.
+        timer.since("jobs", _t_jobs)
+
         res.notes = self._notes(res)
+
+        _t = timer.start()
         self.trace_data(res, hops=data_hops)
+        timer.since("data-trace", _t)
+
+        _t = timer.start()
         self._unresolved_calls(programs, res)
+        timer.since("unresolved-calls", _t)
+
+        _t = timer.start()
+        # extend, not assign: trace_data and the deck resolver already recorded
+        # references they could not confirm, and those must not be discarded.
         res.blind_spots.extend(self._blind_spots(seed_files, programs))
+        timer.since("blind-spots", _t)
+
+        timer.report()
         return res
 
     def _steps_from_direct_refs(self, seed_files, targets, min_confidence,

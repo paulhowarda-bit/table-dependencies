@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -523,6 +524,165 @@ class TestLibraryApi(unittest.TestCase):
         for name in ("index", "query", "open_index", "tables", "Result",
                      "Store", "Analyzer"):
             self.assertTrue(hasattr(mfdep, name), name)
+
+
+class _FakeLog:
+    """Captures StageTimer's log calls so tests never leak to stderr."""
+
+    def __init__(self):
+        self.infos = []
+        self.warnings = []
+
+    def info(self, msg):
+        self.infos.append(msg)
+
+    def warning(self, msg):
+        self.warnings.append(msg)
+
+
+class TestStageTimer(unittest.TestCase):
+    """The timer is a no-op unless something consumes it, and never fails a run."""
+
+    def _timer(self, enabled, sink=None):
+        from mfdep.profiling import StageTimer
+        self.log = _FakeLog()
+        return StageTimer(self.log, enabled, "src", sink=sink)
+
+    def test_disabled_collects_nothing(self):
+        t = self._timer(False)
+        self.assertFalse(t.enabled)
+        with t.stage("a"):
+            pass
+        t.since("b", t.start())          # start() returns None when disabled
+        t.report()
+        self.assertEqual(t.timings(), [])
+        self.assertEqual(self.log.infos, [])
+
+    def test_sink_turns_collection_on_without_the_flag(self):
+        seen = {}
+        t = self._timer(False, sink=lambda rows: seen.setdefault("rows", rows))
+        self.assertTrue(t.enabled)       # a sink is enough to enable
+        with t.stage("a"):
+            pass
+        t.report()
+        self.assertEqual([r["stage"] for r in seen["rows"]], ["a"])
+        self.assertEqual(self.log.infos, [])   # sink-only: no stderr echo
+
+    def test_stage_and_since_both_record_in_order(self):
+        t = self._timer(True)
+        with t.stage("first"):
+            pass
+        t.since("second", t.start())
+        rows = t.timings()
+        self.assertEqual([r["stage"] for r in rows], ["first", "second"])
+        self.assertTrue(all(isinstance(r["ms"], float) for r in rows))
+
+    def test_echo_reports_through_the_log(self):
+        t = self._timer(True)
+        with t.stage("only"):
+            pass
+        t.report()
+        joined = "\n".join(self.log.infos)
+        self.assertIn("[src] timing (ms):", joined)
+        self.assertIn("only", joined)
+        self.assertIn("measured", joined)      # summary line, not "total"
+
+    def test_sink_exception_never_fails_the_run(self):
+        def boom(_rows):
+            raise RuntimeError("sink is broken")
+        t = self._timer(True, sink=boom)
+        with t.stage("a"):
+            pass
+        t.report()                        # must not raise
+        self.assertTrue(any("sink is broken" in w for w in self.log.warnings))
+
+
+class TestTimingIntegration(unittest.TestCase):
+    """Timing threaded through the real index and query, via the library API."""
+
+    @classmethod
+    def setUpClass(cls):
+        build()
+        cls.tmp = tempfile.mkdtemp()
+        cls.db = os.path.join(cls.tmp, "timing.db")
+
+    @classmethod
+    def tearDownClass(cls):
+        shutil.rmtree(cls.tmp, ignore_errors=True)
+
+    def test_index_sink_reports_its_stages(self):
+        import mfdep
+        seen = {}
+        mfdep.index(ROOT, db=self.db, workers=1, full=True,
+                    timing_sink=lambda rows: seen.setdefault("rows", rows))
+        stages = [r["stage"] for r in seen["rows"]]
+        self.assertEqual(stages, ["walk", "plan", "prune", "clear", "parse",
+                                  "finalize"])
+        self.assertTrue(all(isinstance(r["ms"], float) for r in seen["rows"]))
+
+    def test_query_sink_reports_its_stages(self):
+        import mfdep
+        mfdep.index(ROOT, db=self.db, workers=1, full=True)
+        seen = {}
+        mfdep.query("PRODDB.CUSTOMER", db=self.db,
+                    timing_sink=lambda rows: seen.setdefault("rows", rows))
+        stages = [r["stage"] for r in seen["rows"]]
+        self.assertEqual(stages, ["targets", "refs", "closure", "jobs",
+                                  "data-trace", "unresolved-calls", "blind-spots"])
+
+    def test_timing_does_not_change_the_answer(self):
+        """Timing is diagnostic: it must never alter the index or the result."""
+        import mfdep
+        s_plain = mfdep.index(ROOT, db=os.path.join(self.tmp, "a.db"),
+                              workers=1, full=True)
+        s_timed = mfdep.index(ROOT, db=os.path.join(self.tmp, "b.db"),
+                              workers=1, full=True, timing_sink=lambda r: None)
+        self.assertEqual(s_plain["files"], s_timed["files"])
+        self.assertEqual(s_plain["table_refs"], s_timed["table_refs"])
+
+        r_plain = mfdep.query("PRODDB.CUSTOMER", db=self.db)
+        r_timed = mfdep.query("PRODDB.CUSTOMER", db=self.db,
+                              timing_sink=lambda r: None)
+        self.assertEqual(len(r_plain.refs), len(r_timed.refs))
+        self.assertEqual(sorted(r_plain.jobs), sorted(r_timed.jobs))
+        self.assertEqual(len(r_plain.blind_spots), len(r_timed.blind_spots))
+
+
+class TestLoggingSetup(unittest.TestCase):
+    """The library configures no logging; only the CLI installs a handler."""
+
+    def test_level_for_mapping(self):
+        import logging
+        from mfdep.logging_setup import level_for
+        self.assertEqual(level_for(), logging.INFO)
+        self.assertEqual(level_for(verbose=1), logging.DEBUG)
+        self.assertEqual(level_for(quiet=1), logging.WARNING)
+        self.assertEqual(level_for(quiet=2), logging.ERROR)
+        self.assertEqual(level_for(verbose=1, quiet=1), logging.WARNING)  # quiet wins
+
+    def test_import_does_not_touch_root_logging(self):
+        """`import mfdep` must add no handler to the root logger, so it cannot
+        hijack a host application's logging."""
+        proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = ("import logging, mfdep;"
+                "print(len(logging.getLogger().handlers))")
+        out = subprocess.check_output([sys.executable, "-c", code], cwd=proj,
+                                      env={**os.environ, "PYTHONPATH": proj})
+        self.assertEqual(out.decode().strip(), "0")
+
+    def test_configure_logging_is_idempotent(self):
+        """Repeated calls replace the CLI handler rather than stacking it."""
+        proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        code = (
+            "import logging;"
+            "from mfdep.logging_setup import configure_logging, PACKAGE_LOGGER;"
+            "configure_logging(); configure_logging(); configure_logging();"
+            "lg = logging.getLogger(PACKAGE_LOGGER);"
+            "print(sum(1 for h in lg.handlers "
+            "if getattr(h, '_mfdep_cli_handler', False)))")
+        out = subprocess.check_output([sys.executable, "-c", code], cwd=proj,
+                                      env={**os.environ, "PYTHONPATH": proj})
+        self.assertEqual(out.decode().strip(), "1")
 
 
 class TestLargeFile(unittest.TestCase):

@@ -159,6 +159,27 @@ Useful `query` flags:
 | `--confidence certain` | drop heuristic dynamic-SQL leads |
 | `--vendor-file v.txt` | add site-specific runtime stubs to the vendor filter |
 | `-v` | every hit, plus every DD dataset per step |
+| `--timing` | log a per-stage wall-clock breakdown to stderr |
+| `--debug` | verbose DEBUG-level logging to stderr |
+
+Both `index` and `query` take `--timing`, which logs where the wall-clock went:
+
+```
+$ python mfdep.py index \\srv\share\PROD --db prod.db --timing
+[prod.db] timing (ms):
+  walk          1840.5
+  plan            30.2
+  prune            0.0
+  clear          210.7
+  parse        74213.9
+  finalize      6120.4
+  measured     82415.7
+```
+
+It says "measured", not "total": cheap glue between the timed stages is
+deliberately unmeasured — the point is to locate the dominant stage, not to
+reconcile to wall-clock. `--timing` is diagnostic only and never changes the
+index or the answer.
 
 ---
 
@@ -236,6 +257,34 @@ with mfdep.open_index("prod.db") as store:
           FROM table_refs r JOIN files f ON f.id = r.file_id
          WHERE r.access = 'WRITE' AND r.table_name = ?
          GROUP BY 1 ORDER BY n DESC""", ("CUSTOMER",)).fetchall()
+```
+
+### Timing and logging
+
+`index()` and `query()` accept a `timing_sink` — a callable handed this run's
+per-stage spans, in call order, so a calling program can route them into its
+own timing log. Supplying it turns collection on without touching stderr:
+
+```python
+spans = []
+mfdep.index("/mnt/mfarchive/PROD", db="prod.db", workers=1,
+            timing_sink=spans.extend)
+# spans == [{"stage": "walk", "ms": 1840.5}, {"stage": "parse", "ms": 74213.9}, ...]
+```
+
+The sink is a diagnostic hook: if it raises, the exception is swallowed (logged
+as a warning) so a broken timing log never fails an index build or a query that
+already did its real work.
+
+The library **configures no logging of its own** — `import mfdep` attaches only
+a `NullHandler`, the documented contract for a well-behaved library, so it never
+touches a host application's logging. Milestone and warning messages flow
+through the `mfdep` logger and stay silent unless the host configures logging;
+only the CLI installs a stderr handler. To see them in your own program:
+
+```python
+import logging
+logging.basicConfig(level=logging.INFO)   # or attach a handler to "mfdep"
 ```
 
 ---
@@ -386,9 +435,11 @@ mfdep/
   store.py            SQLite schema and bulk-load write path
   graph.py            transitive closure  ← the "which jobs break" answer
   report.py           text / CSV / JSON / HTML
+  profiling.py        per-stage wall-clock timing (--timing / timing_sink)
+  logging_setup.py    CLI-side logging; the library configures none
 tests/
   make_fixtures.py    generates a column-exact sample library
-  test_mfdep.py       37 regression tests, one per failure mode
+  test_mfdep.py       regression tests, one per failure mode
 ```
 
 Run the tests:

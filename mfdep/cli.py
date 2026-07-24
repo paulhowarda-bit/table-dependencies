@@ -10,6 +10,7 @@ import time
 from . import __version__
 from .config import CERTAIN, HEURISTIC, LIKELY
 from .graph import Analyzer
+from .logging_setup import configure_logging
 from .report import csv_report, html_report, json_report, text_report
 from .scan import ScanOptions, run_index
 from .store import Store
@@ -62,6 +63,10 @@ def build_parser() -> argparse.ArgumentParser:
     ix.add_argument("--no-prune", action="store_true",
                     help="keep index entries for files no longer on the share")
     ix.add_argument("-q", "--quiet", action="store_true")
+    ix.add_argument("--timing", action="store_true",
+                    help="log a per-stage wall-clock breakdown to stderr")
+    ix.add_argument("--debug", action="store_true",
+                    help="verbose DEBUG-level logging to stderr")
 
     # ---- query
     q = sub.add_parser("query", help="report dependencies of one table")
@@ -86,6 +91,10 @@ def build_parser() -> argparse.ArgumentParser:
     q.add_argument("--html", metavar="FILE")
     q.add_argument("--quiet", action="store_true",
                    help="suppress the text report (use with --csv/--json/--html)")
+    q.add_argument("--timing", action="store_true",
+                   help="log a per-stage wall-clock breakdown to stderr")
+    q.add_argument("--debug", action="store_true",
+                   help="verbose DEBUG-level logging to stderr")
 
     # ---- tables
     t = sub.add_parser("tables", help="list tables the index knows about")
@@ -124,7 +133,7 @@ def cmd_index(a: argparse.Namespace) -> int:
         roots=roots, db_path=a.db, workers=a.workers, chunksize=a.chunksize,
         max_file_mb=a.max_file_mb, include=tuple(a.include),
         exclude=tuple(a.exclude), full=a.full, prune_missing=not a.no_prune,
-        quiet=a.quiet)
+        quiet=a.quiet, timing=a.timing)
     stats = run_index(opts)
 
     if not a.quiet:
@@ -168,7 +177,8 @@ def cmd_query(a: argparse.Namespace) -> int:
     t0 = time.time()
     result = Analyzer(store).analyze(
         a.table, min_confidence=_CONF[a.confidence],
-        include_read=not a.writers_only, data_hops=a.data_hops)
+        include_read=not a.writers_only, data_hops=a.data_hops,
+        timing=a.timing)
     elapsed = time.time() - t0
 
     if not a.quiet:
@@ -296,6 +306,17 @@ _COMMANDS = {"index": cmd_index, "query": cmd_query, "tables": cmd_tables,
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
+    # The CLI owns stderr; the library never configures logging (see
+    # mfdep.logging_setup). --debug raises the level, a subcommand's --quiet
+    # lowers it. Flags absent on read-only subcommands default to off.
+    verbose = 1 if getattr(args, "debug", False) else 0
+    quiet = 1 if getattr(args, "quiet", False) else 0
+    # --timing explicitly asks for the breakdown, so it must not be hidden by a
+    # quiet flag - query's --quiet in particular means "suppress the stdout
+    # report", not "suppress the timing I just asked for".
+    if getattr(args, "timing", False):
+        quiet = 0
+    configure_logging(verbose=verbose, quiet=quiet)
     return _COMMANDS[args.command](args)
 
 

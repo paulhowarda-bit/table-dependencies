@@ -18,6 +18,7 @@ eight writers, and the facts coming back are tiny compared to the file bodies.
 from __future__ import annotations
 
 import fnmatch
+import logging
 import os
 import sys
 import time
@@ -27,8 +28,11 @@ from dataclasses import dataclass
 from .config import BULK_LOAD_FILES, DEFAULT_CHUNKSIZE, SKIP_DIRS
 from .extract import extract_file
 from .facts import FileFacts
+from .profiling import StageTimer
 from .store import Store
 from .util import long_path
+
+_log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -43,6 +47,10 @@ class ScanOptions:
     full: bool = False
     prune_missing: bool = True
     quiet: bool = False
+    timing: bool = False        # log a per-stage wall-clock breakdown to stderr
+    # callable(rows) for a library caller's timing log; Any to avoid importing
+    # the profiling types into this module's signature.
+    timing_sink: "object | None" = None
 
 
 @dataclass
@@ -89,8 +97,7 @@ def walk(roots: list[str], include: tuple[str, ...], exclude: tuple[str, ...],
                         except OSError:
                             continue      # permission denied on one entry
             except OSError as exc:
-                print(f"  ! cannot read directory {current}: {exc}",
-                      file=sys.stderr)
+                _log.warning(f"cannot read directory {current}: {exc}")
 
     if on_progress:
         on_progress(seen_dirs, len(out))
@@ -106,57 +113,66 @@ def run_index(opts: ScanOptions) -> dict:
     started = time.time()
     workers = opts.workers or (os.cpu_count() or 4)
     max_bytes = opts.max_file_mb << 20
+    timer = StageTimer(_log, opts.timing, opts.db_path, sink=opts.timing_sink)
 
-    def say(msg: str) -> None:
-        if not opts.quiet:
-            print(msg, file=sys.stderr, flush=True)
+    def bar(text: str, newline: bool = False) -> None:
+        # A live \r progress line - terminal UI, not a log record. Shown only
+        # when INFO output is wanted and the caller did not ask for quiet, so a
+        # library caller (quiet by default) and a `-q` run never see it.
+        if opts.quiet or not _log.isEnabledFor(logging.INFO):
+            return
+        print(text, end="\n" if newline else "", file=sys.stderr, flush=True)
 
-    say(f"Walking {len(opts.roots)} root(s)...")
+    _log.info(f"Walking {len(opts.roots)} root(s)...")
 
     def walk_progress(dirs: int, files: int) -> None:
-        if not opts.quiet:
-            print(f"\r  {dirs:,} dirs, {files:,} files found", end="",
-                  file=sys.stderr, flush=True)
+        bar(f"\r  {dirs:,} dirs, {files:,} files found")
 
-    candidates = walk(opts.roots, opts.include, opts.exclude, walk_progress)
-    if not opts.quiet:
-        print(file=sys.stderr)
-    say(f"Found {len(candidates):,} files in {time.time() - started:.1f}s")
+    with timer.stage("walk"):
+        candidates = walk(opts.roots, opts.include, opts.exclude, walk_progress)
+    bar("", newline=True)
+    _log.info(f"Found {len(candidates):,} files in {time.time() - started:.1f}s")
 
     store = Store(opts.db_path, fast=True)
     if store.stale_schema:
         # The extracted facts changed shape, so the old rows cannot be reused.
         # Rebuild rather than mixing layouts or reporting from a stale mix.
-        say("Index was built by an older version - rebuilding it from scratch")
+        _log.info("Index was built by an older version - rebuilding from scratch")
         store.rebuild_schema()
         opts.full = True
     store.set_meta("roots", os.pathsep.join(opts.roots))
 
     todo = candidates
     skipped = 0
+    _t = timer.start()
     if not opts.full:
         sigs = store.existing_signatures()
         todo = [c for c in candidates
                 if sigs.get(c.path) != (c.size, c.mtime_ns)]
         skipped = len(candidates) - len(todo)
         if skipped:
-            say(f"Skipping {skipped:,} unchanged files (incremental)")
+            _log.info(f"Skipping {skipped:,} unchanged files (incremental)")
+    timer.since("plan", _t)
 
     if opts.prune_missing:
+        _t = timer.start()
         present = {c.path for c in candidates}
         gone = [p for p in store.all_paths() if p not in present]
         if gone:
-            say(f"Pruning {len(gone):,} files no longer on the share")
+            _log.info(f"Pruning {len(gone):,} files no longer on the share")
             store.delete_paths(gone)
+        timer.since("prune", _t)
 
     # Clear the old rows for everything about to be re-parsed, in one batch.
     # Doing it up front means every write in the parse loop is a pure INSERT
     # with no read-back, which is most of why the load is fast.
+    _t = timer.start()
     stale = [c.path for c in todo]
     if stale and not opts.full:
         store.delete_paths(stale)
     elif opts.full:
         store.delete_paths([c.path for c in candidates])
+    timer.since("clear", _t)
 
     jobs = [(c.path, c.size, c.mtime_ns, max_bytes) for c in todo]
     total = len(jobs)
@@ -164,6 +180,7 @@ def run_index(opts: ScanOptions) -> dict:
     bytes_done = 0
     t0 = time.time()
 
+    _t_parse = timer.start()
     if total:
         # Maintaining 21 indexes per inserted row costs several times the parse
         # itself, so a bulk load drops them and rebuilds once at the end. Not
@@ -172,25 +189,26 @@ def run_index(opts: ScanOptions) -> dict:
         bulk = total >= BULK_LOAD_FILES
         if bulk:
             store.drop_indexes()
+
         def progress() -> None:
-            if opts.quiet or done % 200:
+            if done % 200:
                 return
             elapsed = max(time.time() - t0, 0.001)
             rate = done / elapsed
             eta = (total - done) / rate if rate else 0
-            print(f"\r  {done:,}/{total:,}  {rate:,.0f} files/s  "
-                  f"{bytes_done / 1e6:,.0f} MB  ETA {eta / 60:,.1f}m  "
-                  f"errors {errors}", end="", file=sys.stderr, flush=True)
+            bar(f"\r  {done:,}/{total:,}  {rate:,.0f} files/s  "
+                f"{bytes_done / 1e6:,.0f} MB  ETA {eta / 60:,.1f}m  "
+                f"errors {errors}")
 
         if workers == 1:
             # Serial, in-process: no pool, so an embedding caller needs no
             # __main__ guard. On Windows the pool spawns by re-importing the
             # calling module, and a library user without that guard would have
             # every worker re-run their script and spawn its own workers.
-            say(f"Parsing {total:,} files serially (workers=1)...")
+            _log.info(f"Parsing {total:,} files serially (workers=1)...")
             results = map(_worker, jobs)
         else:
-            say(f"Parsing {total:,} files with {workers} workers...")
+            _log.info(f"Parsing {total:,} files with {workers} workers...")
             pool = ProcessPoolExecutor(max_workers=workers)
             results = pool.map(_worker, jobs, chunksize=opts.chunksize)
 
@@ -206,15 +224,18 @@ def run_index(opts: ScanOptions) -> dict:
             if workers != 1:
                 pool.shutdown()
 
-        if not opts.quiet:
-            print(file=sys.stderr)
+        bar("", newline=True)
+    timer.since("parse", _t_parse)
 
     store.set_meta("indexed_at", str(int(time.time())))
+    _t = timer.start()
     store.optimize()
+    timer.since("finalize", _t)
     stats = store.stats()
     store.close()
 
     elapsed = time.time() - started
-    say(f"Indexed {done:,} files ({errors:,} unreadable) in {elapsed / 60:.1f}m")
+    _log.info(f"Indexed {done:,} files ({errors:,} unreadable) in {elapsed / 60:.1f}m")
+    timer.report()
     return {"scanned": done, "skipped": skipped, "errors": errors,
             "seconds": elapsed, **stats}

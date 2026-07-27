@@ -13,3 +13,8 @@ impact.csv
 *.egg-info/
 build/
 dist/
+
+# The mfdep package itself is not shipped from this repo. The local copy exists
+# only so the consumer template can be tested against a real index. Consumers
+# get mfdep from ../mainframe_tracer/src/network_drive instead.
+/mfdep/

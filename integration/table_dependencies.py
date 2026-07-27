@@ -14,6 +14,9 @@ Two rules make "test here, run at work" work cleanly:
   * Import mfdep by PACKAGE NAME (``import mfdep``), never by a path into a
     checkout. Whatever ``mfdep`` is installed in the environment wins - the work
     build at work, the dev copy in a test venv. This file does not care which.
+    At work the package ships inside network_drive, at
+    ``src/network_drive/mfdep/``; ``_ensure_src_on_path`` below puts that
+    directory on ``sys.path`` so the bare import still resolves with no install.
   * Take the index PATH from the ``network_drive`` package, which owns where the
     shared ``mfdep.db`` lives at work. Off the work machine (no network_drive
     installed) it falls back to ``$MFDEP_DB`` or ``./mfdep.db`` so the adapter
@@ -28,27 +31,61 @@ from pathlib import Path
 from typing import Any, Dict
 
 
+#: Where mfdep sits inside a tracer checkout, relative to that checkout's parent.
+_WORK_SUBPATH = Path("mainframe_tracer") / "src" / "network_drive"
+
+
+def _put_on_path(pkg_parent: Path) -> None:
+    """Add the directory that holds ``mfdep/`` to ``sys.path``.
+
+    When that directory is the network_drive package itself, its parent goes on
+    too, so ``from network_drive import DB_DIR`` keeps working alongside the
+    bare ``import mfdep``.
+    """
+    sys.path.insert(0, str(pkg_parent))
+    if pkg_parent.name == "network_drive":
+        sys.path.insert(0, str(pkg_parent.parent))
+
+
 def _ensure_src_on_path() -> None:
     """Make ``import mfdep`` work straight from a download, with no install.
 
     Tries a normal import first, so a pip-installed mfdep (or an already
     configured path) wins and this does nothing. Only when that fails does it
-    walk up from this file to the directory that holds the vendored ``mfdep/``
-    package and put it on ``sys.path``. That directory is the project's ``src``
-    root, so the same step also makes ``network_drive`` and the rest of the
-    project importable - one bootstrap, zero setup, independent of the current
-    working directory.
+    look for a vendored copy, in the three layouts that occur in practice. At
+    each level going up from this file:
+
+      * ``<dir>/mfdep/`` - the package sits at the root beside the template,
+        which is the local test checkout.
+      * ``<dir>/network_drive/mfdep/`` - the work layout, where mfdep ships
+        inside the network_drive package. This is the one that matches when the
+        template has been copied to ``src/tracer_agent/`` at work.
+      * ``<dir>/mainframe_tracer/src/network_drive/mfdep/`` - a tracer checkout
+        sitting beside this repo rather than above it. Walking up alone never
+        finds this, because it is a sibling branch of the tree, not an ancestor.
+
+    The nearest match wins, so a local copy takes precedence over a sibling
+    checkout. ``$MFDEP_HOME``, if set to the directory containing ``mfdep/``,
+    overrides the search entirely - the escape hatch for a layout none of the
+    three cover.
     """
     try:
         import mfdep  # noqa: F401
         return
     except ImportError:
         pass
+
+    override = os.environ.get("MFDEP_HOME")
+    if override and (Path(override) / "mfdep" / "__init__.py").is_file():
+        _put_on_path(Path(override).resolve())
+        return
+
     for parent in Path(__file__).resolve().parents:
-        if (parent / "mfdep" / "__init__.py").is_file():
-            sys.path.insert(0, str(parent))
-            return
-    # Not found beside us; the import below raises a clear ImportError.
+        for candidate in (parent, parent / "network_drive", parent / _WORK_SUBPATH):
+            if (candidate / "mfdep" / "__init__.py").is_file():
+                _put_on_path(candidate)
+                return
+    # Not found anywhere; the import below raises a clear ImportError.
 
 
 _ensure_src_on_path()

@@ -16,6 +16,7 @@ import unittest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+import mfdep                                                        # noqa: E402
 from mfdep.graph import Analyzer                                    # noqa: E402
 from mfdep.parsers.cobol import build_blob, is_free_format          # noqa: E402
 from mfdep.scan import ScanOptions, run_index                       # noqa: E402
@@ -23,6 +24,11 @@ from mfdep.sqlscan import scan_sql                                  # noqa: E402
 from mfdep.store import Store                                       # noqa: E402
 from mfdep.util import mask_sql_noise, split_qualified              # noqa: E402
 from make_fixtures import ROOT, build                               # noqa: E402
+
+#: Where the package actually lives. conftest resolves mfdep from a local copy,
+#: a sibling tracer checkout, or $MFDEP_HOME, so it is not necessarily inside
+#: this repo - the vendoring tests below have to copy from wherever it landed.
+MFDEP_PKG_DIR = os.path.dirname(os.path.abspath(mfdep.__file__))
 
 
 def tables(sql: str) -> set[tuple[str, str, str]]:
@@ -651,7 +657,9 @@ class TestLoggingSetup(unittest.TestCase):
     def test_import_does_not_touch_root_logging(self):
         """`import mfdep` must add no handler to the root logger, so it cannot
         hijack a host application's logging."""
-        proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # The dir holding the package, not this repo's root - mfdep is not
+        # necessarily vendored here (see conftest).
+        proj = os.path.dirname(MFDEP_PKG_DIR)
         code = ("import logging, mfdep;"
                 "print(len(logging.getLogger().handlers))")
         out = subprocess.check_output([sys.executable, "-c", code], cwd=proj,
@@ -660,7 +668,9 @@ class TestLoggingSetup(unittest.TestCase):
 
     def test_configure_logging_is_idempotent(self):
         """Repeated calls replace the CLI handler rather than stacking it."""
-        proj = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        # The dir holding the package, not this repo's root - mfdep is not
+        # necessarily vendored here (see conftest).
+        proj = os.path.dirname(MFDEP_PKG_DIR)
         code = (
             "import logging;"
             "from mfdep.logging_setup import configure_logging, PACKAGE_LOGGER;"
@@ -673,7 +683,7 @@ class TestLoggingSetup(unittest.TestCase):
         self.assertEqual(out.decode().strip(), "1")
 
 
-class TestZeroInstallConsumer(unittest.TestCase):
+class _ZeroInstallConsumerMixin:
     """"Download and run": the integration template must find both mfdep and
     network_drive with no install and nothing on PYTHONPATH, by self-locating
     the vendored packages from its own file position.
@@ -681,7 +691,14 @@ class TestZeroInstallConsumer(unittest.TestCase):
     The subprocess runs with -S -E (no site-packages, ignore PYTHON* env), so a
     separately pip-installed mfdep cannot mask the bootstrap - the only mfdep
     reachable is the vendored copy the template must find on its own.
+
+    ``NESTED`` selects the layout to vendor, since both occur in practice and
+    the bootstrap has to cope with either. Not a TestCase itself, so unittest
+    collects only the two concrete subclasses below.
     """
+
+    #: False -> src/mfdep/ (local checkout); True -> src/network_drive/mfdep/ (work).
+    NESTED = False
 
     @classmethod
     def setUpClass(cls):
@@ -692,7 +709,9 @@ class TestZeroInstallConsumer(unittest.TestCase):
         os.makedirs(os.path.join(src, "tracer_agent"))
         repo = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
         # Vendor the package and drop the template in as the consumer.
-        shutil.copytree(os.path.join(repo, "mfdep"), os.path.join(src, "mfdep"),
+        dest = (os.path.join(src, "network_drive", "mfdep") if cls.NESTED
+                else os.path.join(src, "mfdep"))
+        shutil.copytree(MFDEP_PKG_DIR, dest,
                         ignore=shutil.ignore_patterns("__pycache__"))
         shutil.copy(
             os.path.join(repo, "integration", "table_dependencies.py"),
@@ -733,6 +752,24 @@ class TestZeroInstallConsumer(unittest.TestCase):
         refs, jobs = (int(x) for x in counts.split())
         self.assertGreater(refs, 0)
         self.assertGreater(jobs, 0)
+
+
+class TestZeroInstallConsumer(_ZeroInstallConsumerMixin, unittest.TestCase):
+    """Local checkout: mfdep sits at the src root, beside network_drive."""
+
+    NESTED = False
+
+
+class TestZeroInstallConsumerNested(_ZeroInstallConsumerMixin, unittest.TestCase):
+    """Work layout: mfdep ships inside the network_drive package.
+
+    The bootstrap has to put two directories on the path here - network_drive
+    itself so ``import mfdep`` resolves, and its parent so ``network_drive``
+    stays importable for DB_DIR. Asserting the db path resolves through
+    network_drive proves both halves worked.
+    """
+
+    NESTED = True
 
 
 class TestLargeFile(unittest.TestCase):

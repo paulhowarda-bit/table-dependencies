@@ -15,9 +15,15 @@ imports mfdep by package name, so the tests have to as well.
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
+
+#: A submodule that only the real package has. Used to tell it apart from a
+#: shim - the tracer installs one at src/mfdep/__init__.py that re-exports
+#: __version__ and nothing else.
+_PROBE_SUBMODULE = "mfdep.store"
 
 #: How far up to look for a tracer checkout sitting beside this file's tree.
 #: Bounded because that step lists directories, and walking to the filesystem
@@ -48,14 +54,43 @@ def _put_on_path(pkg_parent: Path) -> None:
     sys.path.insert(0, str(pkg_parent))
     if pkg_parent.name == "network_drive":
         sys.path.insert(0, str(pkg_parent.parent))
+    importlib.invalidate_caches()
+
+
+def _real_mfdep_importable() -> bool:
+    """True only if a plain ``import mfdep`` lands on the *usable* package.
+
+    Import success alone is not enough. The tracer is editable-installed and
+    ships a top-level ``mfdep`` shim that re-exports ``__version__`` and has no
+    submodules, so the import succeeds and every ``from mfdep.graph import ...``
+    afterwards fails. Probing for a submodule distinguishes the two.
+    """
+    try:
+        import mfdep  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        return importlib.util.find_spec(_PROBE_SUBMODULE) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
+def _forget_mfdep() -> None:
+    """Drop a shim from ``sys.modules`` so the search result imports cleanly.
+
+    Without this, putting the real package on ``sys.path`` changes nothing:
+    ``import mfdep`` returns the already-cached shim rather than re-resolving.
+    """
+    for name in [n for n in sys.modules
+                 if n == "mfdep" or n.startswith("mfdep.")]:
+        del sys.modules[name]
 
 
 def _resolve_mfdep() -> None:
-    try:
-        import mfdep  # noqa: F401
+    if _real_mfdep_importable():
         return
-    except ImportError:
-        pass
+    # A shim answered the import. Forget it, or the search below is pointless.
+    _forget_mfdep()
 
     override = os.environ.get("MFDEP_HOME")
     if override and (Path(override) / "mfdep" / "__init__.py").is_file():

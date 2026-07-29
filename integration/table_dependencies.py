@@ -25,10 +25,16 @@ Two rules make "test here, run at work" work cleanly:
 
 from __future__ import annotations
 
+import importlib.util
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
+
+#: A submodule that only the real package has. Used to tell it apart from a
+#: shim - the tracer installs one at src/mfdep/__init__.py that re-exports
+#: __version__ and nothing else.
+_PROBE_SUBMODULE = "mfdep.store"
 
 
 #: How far up to look for a tracer checkout sitting beside this file's tree.
@@ -66,15 +72,47 @@ def _put_on_path(pkg_parent: Path) -> None:
     sys.path.insert(0, str(pkg_parent))
     if pkg_parent.name == "network_drive":
         sys.path.insert(0, str(pkg_parent.parent))
+    importlib.invalidate_caches()
+
+
+def _real_mfdep_importable() -> bool:
+    """True only if a plain ``import mfdep`` lands on the *usable* package.
+
+    Import success alone is not enough. The tracer is editable-installed and
+    ships a top-level ``mfdep`` shim that re-exports ``__version__`` and has no
+    submodules, so a bare import succeeds and then every ``mfdep.query`` and
+    ``from mfdep.report import ...`` afterwards fails. Probing for a submodule
+    is what distinguishes the two.
+    """
+    try:
+        import mfdep  # noqa: F401
+    except ImportError:
+        return False
+    try:
+        return importlib.util.find_spec(_PROBE_SUBMODULE) is not None
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
+def _forget_mfdep() -> None:
+    """Drop a shim from ``sys.modules`` so the search result imports cleanly.
+
+    Without this, putting the real package on ``sys.path`` changes nothing:
+    ``import mfdep`` returns the already-cached shim rather than re-resolving.
+    """
+    for name in [n for n in sys.modules
+                 if n == "mfdep" or n.startswith("mfdep.")]:
+        del sys.modules[name]
 
 
 def _ensure_src_on_path() -> None:
     """Make ``import mfdep`` work straight from a download, with no install.
 
     Tries a normal import first, so a pip-installed mfdep (or an already
-    configured path) wins and this does nothing. Only when that fails does it
-    look for a vendored copy, in the three layouts that occur in practice. At
-    each level going up from this file:
+    configured path) wins and this does nothing - but only if that import is
+    the real package and not a version shim, see ``_real_mfdep_importable``.
+    Otherwise it looks for a vendored copy, in the three layouts that occur in
+    practice. At each level going up from this file:
 
       * ``<dir>/mfdep/`` - the package sits at the root beside the template,
         which is the local test checkout.
@@ -90,11 +128,10 @@ def _ensure_src_on_path() -> None:
     overrides the search entirely - the escape hatch for a layout none of the
     three cover.
     """
-    try:
-        import mfdep  # noqa: F401
+    if _real_mfdep_importable():
         return
-    except ImportError:
-        pass
+    # A shim answered the import. Forget it, or the search below is pointless.
+    _forget_mfdep()
 
     override = os.environ.get("MFDEP_HOME")
     if override and (Path(override) / "mfdep" / "__init__.py").is_file():

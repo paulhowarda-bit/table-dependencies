@@ -20,10 +20,26 @@ import os
 import sys
 from pathlib import Path
 
-#: A submodule that only the real package has. Used to tell it apart from a
-#: shim - the tracer installs one at src/mfdep/__init__.py that re-exports
-#: __version__ and nothing else.
-_PROBE_SUBMODULE = "mfdep.store"
+#: Marks a package that is new enough to be usable as a library. Deliberately
+#: not store.py, which exists in the older CLI-only builds too - probing for
+#: that accepts a stale copy and defers the failure to 20-odd broken tests.
+_PROBE_SUBMODULE = "mfdep.api"
+
+#: The library entry points the consumer template and these tests both call.
+_REQUIRED_ATTRS = ("query", "index", "open_index", "tables")
+
+
+def _why_unusable(module) -> str:
+    """Empty string if this mfdep is usable, else the reason it is not."""
+    missing = [a for a in _REQUIRED_ATTRS if not hasattr(module, a)]
+    if missing:
+        return "missing " + ", ".join("mfdep." + a + "()" for a in missing)
+    try:
+        if importlib.util.find_spec(_PROBE_SUBMODULE) is None:
+            return "no " + _PROBE_SUBMODULE + " submodule"
+    except (ImportError, AttributeError, ValueError):
+        return "no " + _PROBE_SUBMODULE + " submodule"
+    return ""
 
 #: How far up to look for a tracer checkout sitting beside this file's tree.
 #: Bounded because that step lists directories, and walking to the filesystem
@@ -57,22 +73,34 @@ def _put_on_path(pkg_parent: Path) -> None:
     importlib.invalidate_caches()
 
 
-def _real_mfdep_importable() -> bool:
-    """True only if a plain ``import mfdep`` lands on the *usable* package.
+#: Anything importable but unusable, recorded so the error can name it.
+_rejected: list = []
 
-    Import success alone is not enough. The tracer is editable-installed and
-    ships a top-level ``mfdep`` shim that re-exports ``__version__`` and has no
-    submodules, so the import succeeds and every ``from mfdep.graph import ...``
-    afterwards fails. Probing for a submodule distinguishes the two.
+
+def _real_mfdep_importable() -> bool:
+    """True only if a plain ``import mfdep`` lands on a *usable* package.
+
+    Import success alone is not enough. Two things answer to the name and are
+    not the package this repo needs:
+
+      * the version shim the tracer installs at ``src/mfdep/__init__.py``,
+        which re-exports ``__version__`` and has no submodules at all;
+      * a stale build from before mfdep grew a library API, which has the
+        parsers and the store but no ``api``, ``profiling`` or
+        ``logging_setup``, so ``mfdep.query()`` does not exist.
+
+    Both fail far from the cause if accepted here, so reject and keep looking.
     """
     try:
         import mfdep  # noqa: F401
     except ImportError:
         return False
-    try:
-        return importlib.util.find_spec(_PROBE_SUBMODULE) is not None
-    except (ImportError, AttributeError, ValueError):
+    reason = _why_unusable(mfdep)
+    if reason:
+        _rejected.append((getattr(mfdep, "__file__", "?"),
+                          getattr(mfdep, "__version__", "unknown"), reason))
         return False
+    return True
 
 
 def _forget_mfdep() -> None:
@@ -86,28 +114,63 @@ def _forget_mfdep() -> None:
         del sys.modules[name]
 
 
+def _has_library_api(pkg_dir: Path) -> bool:
+    """Cheap staleness screen for a candidate, done on the filesystem.
+
+    api.py is what the library entry points live in, so a build without it is
+    the pre-library CLI-only mfdep. Checked by looking rather than importing,
+    so a stale copy is skipped without leaving half-imported state behind.
+    """
+    return (pkg_dir / "__init__.py").is_file() and (pkg_dir / "api.py").is_file()
+
+
+def _all_candidates():
+    override = os.environ.get("MFDEP_HOME")
+    if override:
+        yield Path(override)
+    yield from _candidate_dirs(Path(__file__).resolve())
+
+
+def _not_found_message(stale) -> str:
+    lines = ["Cannot find a usable mfdep package."]
+    for path, version, reason in _rejected:
+        lines.append("  rejected (importable): %s [%s] - %s"
+                     % (path, version, reason))
+    for path in stale:
+        lines.append("  rejected (stale, no api.py): %s" % path)
+    if _rejected or stale:
+        lines.append("")
+        lines.append("Those are older or partial builds. Deploy the current "
+                     "mfdep package over them rather than adding exports by "
+                     "hand - query/index/open_index/tables come from api.py, "
+                     "which those copies do not have.")
+    lines.append("")
+    lines.append("Looked for mfdep/ in: a local directory beside this repo, a "
+                 "network_drive package above it, <tracer>/src/network_drive/ "
+                 "beside it, and $MFDEP_HOME. Set MFDEP_HOME to the directory "
+                 "*containing* mfdep/.")
+    return "\n".join(lines)
+
+
 def _resolve_mfdep() -> None:
     if _real_mfdep_importable():
         return
-    # A shim answered the import. Forget it, or the search below is pointless.
+    # Something unusable answered the import. Forget it, or the search below
+    # is pointless: `import mfdep` would just return the cached module.
     _forget_mfdep()
 
-    override = os.environ.get("MFDEP_HOME")
-    if override and (Path(override) / "mfdep" / "__init__.py").is_file():
-        _put_on_path(Path(override).resolve())
+    stale = []
+    for candidate in _all_candidates():
+        pkg = candidate / "mfdep"
+        if not (pkg / "__init__.py").is_file():
+            continue
+        if not _has_library_api(pkg):
+            stale.append(str(pkg))
+            continue
+        _put_on_path(candidate.resolve())
         return
 
-    for candidate in _candidate_dirs(Path(__file__).resolve()):
-        if (candidate / "mfdep" / "__init__.py").is_file():
-            _put_on_path(candidate)
-            return
-
-    raise ImportError(
-        "Cannot find the mfdep package. These tests need it in a local mfdep/ "
-        "directory, inside a network_drive package above them, in a tracer "
-        "checkout beside this repo at <tracer>/src/network_drive/mfdep, or on "
-        "$MFDEP_HOME. Set MFDEP_HOME to the directory *containing* mfdep/."
-    )
+    raise ImportError(_not_found_message(stale))
 
 
 _resolve_mfdep()

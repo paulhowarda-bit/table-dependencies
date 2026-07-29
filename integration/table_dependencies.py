@@ -26,15 +26,20 @@ Two rules make "test here, run at work" work cleanly:
 from __future__ import annotations
 
 import importlib.util
+import itertools
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
-#: A submodule that only the real package has. Used to tell it apart from a
-#: shim - the tracer installs one at src/mfdep/__init__.py that re-exports
-#: __version__ and nothing else.
-_PROBE_SUBMODULE = "mfdep.store"
+#: Marks a package new enough to be usable as a library. Deliberately not
+#: store.py, which the older CLI-only builds have too - probing for that
+#: accepts a stale copy and defers the failure to the first mfdep.query() call.
+_PROBE_SUBMODULE = "mfdep.api"
+
+#: The entry points this adapter calls. A package without them is not usable
+#: here however successfully it imports.
+_REQUIRED_ATTRS = ("query",)
 
 
 #: How far up to look for a tracer checkout sitting beside this file's tree.
@@ -76,22 +81,35 @@ def _put_on_path(pkg_parent: Path) -> None:
 
 
 def _real_mfdep_importable() -> bool:
-    """True only if a plain ``import mfdep`` lands on the *usable* package.
+    """True only if a plain ``import mfdep`` lands on a *usable* package.
 
-    Import success alone is not enough. The tracer is editable-installed and
-    ships a top-level ``mfdep`` shim that re-exports ``__version__`` and has no
-    submodules, so a bare import succeeds and then every ``mfdep.query`` and
-    ``from mfdep.report import ...`` afterwards fails. Probing for a submodule
-    is what distinguishes the two.
+    Import success alone is not enough. Two things answer to the name and are
+    not the package this adapter needs:
+
+      * the version shim the tracer installs at ``src/mfdep/__init__.py``,
+        which re-exports ``__version__`` and has no submodules at all;
+      * a stale build from before mfdep grew a library API, which has the
+        parsers and the store but no ``api`` module, so ``mfdep.query()`` does
+        not exist.
+
+    Accepting either defers the failure to the first lookup at run time, which
+    is a far worse place to discover it than at import.
     """
     try:
         import mfdep  # noqa: F401
     except ImportError:
         return False
+    if not all(hasattr(mfdep, attr) for attr in _REQUIRED_ATTRS):
+        return False
     try:
         return importlib.util.find_spec(_PROBE_SUBMODULE) is not None
     except (ImportError, AttributeError, ValueError):
         return False
+
+
+def _has_library_api(pkg_dir: Path) -> bool:
+    """Cheap staleness screen for a candidate, done on the filesystem."""
+    return (pkg_dir / "__init__.py").is_file() and (pkg_dir / "api.py").is_file()
 
 
 def _forget_mfdep() -> None:
@@ -134,15 +152,20 @@ def _ensure_src_on_path() -> None:
     _forget_mfdep()
 
     override = os.environ.get("MFDEP_HOME")
-    if override and (Path(override) / "mfdep" / "__init__.py").is_file():
-        _put_on_path(Path(override).resolve())
-        return
+    if override:
+        candidates = itertools.chain([Path(override)],
+                                     _candidate_dirs(Path(__file__).resolve()))
+    else:
+        candidates = _candidate_dirs(Path(__file__).resolve())
 
-    for candidate in _candidate_dirs(Path(__file__).resolve()):
-        if (candidate / "mfdep" / "__init__.py").is_file():
-            _put_on_path(candidate)
+    for candidate in candidates:
+        pkg = candidate / "mfdep"
+        if pkg.joinpath("__init__.py").is_file() and _has_library_api(pkg):
+            _put_on_path(candidate.resolve())
             return
-    # Not found anywhere; the import below raises a clear ImportError.
+    # Nothing usable found; the import below raises a clear ImportError. A
+    # stale copy is skipped rather than imported, so the message names the
+    # missing package instead of a missing attribute three calls later.
 
 
 _ensure_src_on_path()

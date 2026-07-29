@@ -20,12 +20,10 @@ import os
 import sys
 from pathlib import Path
 
-#: Marks a package that is new enough to be usable as a library. Deliberately
-#: not store.py, which exists in the older CLI-only builds too - probing for
-#: that accepts a stale copy and defers the failure to 20-odd broken tests.
-_PROBE_SUBMODULE = "mfdep.api"
-
-#: The library entry points the consumer template and these tests both call.
+#: The public interface. This is the whole contract - deliberately not the
+#: presence of any particular module, because how mfdep is laid out internally
+#: is its own business and differs between deployments. Screening on internals
+#: rejects a perfectly good copy that happens to be organised differently.
 _REQUIRED_ATTRS = ("query", "index", "open_index", "tables")
 
 
@@ -34,11 +32,6 @@ def _why_unusable(module) -> str:
     missing = [a for a in _REQUIRED_ATTRS if not hasattr(module, a)]
     if missing:
         return "missing " + ", ".join("mfdep." + a + "()" for a in missing)
-    try:
-        if importlib.util.find_spec(_PROBE_SUBMODULE) is None:
-            return "no " + _PROBE_SUBMODULE + " submodule"
-    except (ImportError, AttributeError, ValueError):
-        return "no " + _PROBE_SUBMODULE + " submodule"
     return ""
 
 #: How far up to look for a tracer checkout sitting beside this file's tree.
@@ -114,16 +107,6 @@ def _forget_mfdep() -> None:
         del sys.modules[name]
 
 
-def _has_library_api(pkg_dir: Path) -> bool:
-    """Cheap staleness screen for a candidate, done on the filesystem.
-
-    api.py is what the library entry points live in, so a build without it is
-    the pre-library CLI-only mfdep. Checked by looking rather than importing,
-    so a stale copy is skipped without leaving half-imported state behind.
-    """
-    return (pkg_dir / "__init__.py").is_file() and (pkg_dir / "api.py").is_file()
-
-
 def _all_candidates():
     override = os.environ.get("MFDEP_HOME")
     if override:
@@ -131,19 +114,16 @@ def _all_candidates():
     yield from _candidate_dirs(Path(__file__).resolve())
 
 
-def _not_found_message(stale) -> str:
+def _not_found_message(searched) -> str:
     lines = ["Cannot find a usable mfdep package."]
     for path, version, reason in _rejected:
-        lines.append("  rejected (importable): %s [%s] - %s"
-                     % (path, version, reason))
-    for path in stale:
-        lines.append("  rejected (stale, no api.py): %s" % path)
-    if _rejected or stale:
-        lines.append("")
-        lines.append("Those are older or partial builds. Deploy the current "
-                     "mfdep package over them rather than adding exports by "
-                     "hand - query/index/open_index/tables come from api.py, "
-                     "which those copies do not have.")
+        lines.append("  rejected: %s [%s] - %s" % (path, version, reason))
+    for path in searched:
+        lines.append("  found but not usable: %s" % path)
+    lines.append("")
+    lines.append("mfdep must expose " + ", ".join(_REQUIRED_ATTRS) + " at the "
+                 "top level. Only the interface is checked - how the package "
+                 "is laid out internally does not matter here.")
     lines.append("")
     lines.append("Looked for mfdep/ in: a local directory beside this repo, a "
                  "network_drive package above it, <tracer>/src/network_drive/ "
@@ -159,18 +139,20 @@ def _resolve_mfdep() -> None:
     # is pointless: `import mfdep` would just return the cached module.
     _forget_mfdep()
 
-    stale = []
+    searched = []
     for candidate in _all_candidates():
-        pkg = candidate / "mfdep"
-        if not (pkg / "__init__.py").is_file():
-            continue
-        if not _has_library_api(pkg):
-            stale.append(str(pkg))
+        if not (candidate / "mfdep" / "__init__.py").is_file():
             continue
         _put_on_path(candidate.resolve())
-        return
+        _forget_mfdep()
+        if _real_mfdep_importable():
+            return
+        # Present but does not meet the interface. Keep looking; the path entry
+        # stays, harmlessly, since a later match is inserted ahead of it.
+        searched.append(str(candidate / "mfdep"))
+        _forget_mfdep()
 
-    raise ImportError(_not_found_message(stale))
+    raise ImportError(_not_found_message(searched))
 
 
 _resolve_mfdep()

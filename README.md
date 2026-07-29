@@ -5,10 +5,10 @@ adapter the tracer_agent uses to ask "what depends on this DB2 table", plus the
 regression suite that proves the call path still works.
 
 **mfdep itself is not shipped from here.** It is maintained as its own package
-and lands in the using system at:
+and lands in the using system inside the tracer's `network_drive` package:
 
 ```
-mainframe_tracer/src/network_drive/mfdep/
+<tracer checkout>/src/network_drive/mfdep/
 ```
 
 ## What's in it
@@ -36,11 +36,14 @@ the search run, checking each directory from the file's own location upward:
 | --- | --- |
 | `<dir>/mfdep/` | a local copy sitting beside the template |
 | `<dir>/network_drive/mfdep/` | the tracer at work, once the template has been copied to `src/tracer_agent/` |
-| `<dir>/mainframe_tracer/src/network_drive/mfdep/` | a tracer checkout beside this repo rather than above it |
+| `<sibling>/src/network_drive/mfdep/` | a tracer checkout beside this repo rather than above it |
 
 The nearest match wins. The third case matters because walking up the tree never
 reaches it on its own — a sibling checkout is a different branch of the tree, not
-an ancestor.
+an ancestor. It matches on the `src/network_drive` shape rather than the checkout's
+directory name, which is spelled differently on different machines
+(`mainframe_tracer`, `mainframe-tracer`, …); that scan is bounded to four levels
+up so it stays cheap on a synced or network-mounted profile.
 
 Set `MFDEP_HOME` to the directory *containing* `mfdep/` to override the search
 entirely, for any layout the three above don't cover.

@@ -1,14 +1,16 @@
 """Resolve ``import mfdep`` before the tests are collected.
 
 mfdep is not shipped from this repo. It is maintained separately and lands in
-the using system at ``mainframe_tracer/src/network_drive/mfdep``. The copy in
-``mfdep/`` here is gitignored and exists only so these tests can exercise the
-consumer template against a real package.
+the using system inside the tracer's ``src/network_drive/`` package. The copy
+in ``mfdep/`` here is gitignored and exists only so these tests can exercise
+the consumer template against a real package.
 
 The search order mirrors ``_ensure_src_on_path`` in
 ``integration/table_dependencies.py`` on purpose: if the template's bootstrap
 would fail to find mfdep in a given layout, collection here fails the same way
-rather than quietly succeeding through some other route.
+rather than quietly succeeding through some other route. Rewriting these tests
+to import ``network_drive.mfdep`` directly would defeat that - the consumer
+imports mfdep by package name, so the tests have to as well.
 """
 
 from __future__ import annotations
@@ -17,7 +19,29 @@ import os
 import sys
 from pathlib import Path
 
-_WORK_SUBPATH = Path("mainframe_tracer") / "src" / "network_drive"
+#: How far up to look for a tracer checkout sitting beside this file's tree.
+#: Bounded because that step lists directories, and walking to the filesystem
+#: root is slow on a synced or network-mounted profile.
+_SIBLING_SCAN_DEPTH = 4
+
+
+def _candidate_dirs(start: Path):
+    """Directories that could hold ``mfdep/``, nearest first.
+
+    Deliberately does not hard-code the tracer checkout's directory name - it
+    is spelled differently on different machines - and matches on the
+    ``src/network_drive`` shape instead.
+    """
+    for depth, parent in enumerate(start.parents):
+        yield parent                                  # <dir>/mfdep/
+        yield parent / "network_drive"                # <dir>/network_drive/mfdep/
+        if depth < _SIBLING_SCAN_DEPTH:
+            try:                                      # <sibling>/src/network_drive/mfdep/
+                siblings = sorted(parent.glob("*/src/network_drive"))
+            except OSError:                           # unreadable dir on the way up
+                siblings = []
+            for network_drive in siblings:
+                yield network_drive
 
 
 def _put_on_path(pkg_parent: Path) -> None:
@@ -38,16 +62,16 @@ def _resolve_mfdep() -> None:
         _put_on_path(Path(override).resolve())
         return
 
-    for parent in Path(__file__).resolve().parents:
-        for candidate in (parent, parent / "network_drive", parent / _WORK_SUBPATH):
-            if (candidate / "mfdep" / "__init__.py").is_file():
-                _put_on_path(candidate)
-                return
+    for candidate in _candidate_dirs(Path(__file__).resolve()):
+        if (candidate / "mfdep" / "__init__.py").is_file():
+            _put_on_path(candidate)
+            return
 
     raise ImportError(
-        "Cannot find the mfdep package. These tests need it either beside this "
-        "repo at ../mainframe_tracer/src/network_drive/mfdep, in a local "
-        "mfdep/ directory, or on $MFDEP_HOME."
+        "Cannot find the mfdep package. These tests need it in a local mfdep/ "
+        "directory, inside a network_drive package above them, in a tracer "
+        "checkout beside this repo at <tracer>/src/network_drive/mfdep, or on "
+        "$MFDEP_HOME. Set MFDEP_HOME to the directory *containing* mfdep/."
     )
 
 

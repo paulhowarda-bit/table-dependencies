@@ -31,8 +31,29 @@ from pathlib import Path
 from typing import Any, Dict
 
 
-#: Where mfdep sits inside a tracer checkout, relative to that checkout's parent.
-_WORK_SUBPATH = Path("mainframe_tracer") / "src" / "network_drive"
+#: How far up to look for a tracer checkout sitting beside this file's tree.
+#: Bounded because that step lists directories, and walking to the filesystem
+#: root is slow on a synced or network-mounted profile.
+_SIBLING_SCAN_DEPTH = 4
+
+
+def _candidate_dirs(start: Path):
+    """Directories that could hold ``mfdep/``, nearest first.
+
+    Deliberately does not hard-code the tracer checkout's directory name - it
+    is spelled differently on different machines - and matches on the
+    ``src/network_drive`` shape instead.
+    """
+    for depth, parent in enumerate(start.parents):
+        yield parent                                  # <dir>/mfdep/
+        yield parent / "network_drive"                # <dir>/network_drive/mfdep/
+        if depth < _SIBLING_SCAN_DEPTH:
+            try:                                      # <sibling>/src/network_drive/mfdep/
+                siblings = sorted(parent.glob("*/src/network_drive"))
+            except OSError:                           # unreadable dir on the way up
+                siblings = []
+            for network_drive in siblings:
+                yield network_drive
 
 
 def _put_on_path(pkg_parent: Path) -> None:
@@ -60,9 +81,9 @@ def _ensure_src_on_path() -> None:
       * ``<dir>/network_drive/mfdep/`` - the work layout, where mfdep ships
         inside the network_drive package. This is the one that matches when the
         template has been copied to ``src/tracer_agent/`` at work.
-      * ``<dir>/mainframe_tracer/src/network_drive/mfdep/`` - a tracer checkout
-        sitting beside this repo rather than above it. Walking up alone never
-        finds this, because it is a sibling branch of the tree, not an ancestor.
+      * ``<sibling>/src/network_drive/mfdep/`` - a tracer checkout sitting
+        beside this repo rather than above it. Walking up alone never finds
+        this, because it is a sibling branch of the tree, not an ancestor.
 
     The nearest match wins, so a local copy takes precedence over a sibling
     checkout. ``$MFDEP_HOME``, if set to the directory containing ``mfdep/``,
@@ -80,11 +101,10 @@ def _ensure_src_on_path() -> None:
         _put_on_path(Path(override).resolve())
         return
 
-    for parent in Path(__file__).resolve().parents:
-        for candidate in (parent, parent / "network_drive", parent / _WORK_SUBPATH):
-            if (candidate / "mfdep" / "__init__.py").is_file():
-                _put_on_path(candidate)
-                return
+    for candidate in _candidate_dirs(Path(__file__).resolve()):
+        if (candidate / "mfdep" / "__init__.py").is_file():
+            _put_on_path(candidate)
+            return
     # Not found anywhere; the import below raises a clear ImportError.
 
 

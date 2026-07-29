@@ -11,12 +11,12 @@ index location and calls ``mfdep.query()``, the same way the tracer_agent calls
 
 Two rules make "test here, run at work" work cleanly:
 
-  * Import mfdep by PACKAGE NAME (``import mfdep``), never by a path into a
-    checkout. Whatever ``mfdep`` is installed in the environment wins - the work
-    build at work, the dev copy in a test venv. This file does not care which.
-    At work the package ships inside network_drive, at
-    ``src/network_drive/mfdep/``; ``_ensure_src_on_path`` below puts that
-    directory on ``sys.path`` so the bare import still resolves with no install.
+  * Import mfdep by PACKAGE NAME (``import mfdep``). The package lives inside
+    network_drive at work, so ``_SEARCH`` below puts that directory on
+    ``sys.path`` and the bare import resolves with no install. It is an
+    explicit list of places, not a search - if none of them is right on a given
+    machine, set ``$MFDEP_HOME`` to the directory containing ``mfdep/`` rather
+    than adding cleverness here.
   * Take the index PATH from the ``network_drive`` package, which owns where the
     shared ``mfdep.db`` lives at work. Off the work machine (no network_drive
     installed) it falls back to ``$MFDEP_DB`` or ``./mfdep.db`` so the adapter
@@ -25,133 +25,36 @@ Two rules make "test here, run at work" work cleanly:
 
 from __future__ import annotations
 
-import importlib.util
-import itertools
 import os
 import sys
 from pathlib import Path
 from typing import Any, Dict
 
-#: The entry points this adapter calls. This is the whole contract - checked
-#: on the imported module, never on which files the package is made of, since
-#: mfdep's internal layout is its own business and differs between deployments.
-_REQUIRED_ATTRS = ("query",)
+_HERE = Path(__file__).resolve().parent
 
+#: Directories that may contain ``mfdep/``, most specific first. At work this
+#: file sits in ``src/tracer_agent/``, so the package is one level up inside
+#: network_drive; in this repo it is a local copy or a tracer checkout beside
+#: us. ``$MFDEP_HOME`` overrides both.
+_SEARCH = [
+    os.environ.get("MFDEP_HOME"),
+    _HERE.parent / "network_drive",                                  # at work
+    _HERE.parent,                                                    # local copy
+    _HERE.parent.parent / "mainframe-tracer" / "src" / "network_drive",
+]
 
-#: How far up to look for a tracer checkout sitting beside this file's tree.
-#: Bounded because that step lists directories, and walking to the filesystem
-#: root is slow on a synced or network-mounted profile.
-_SIBLING_SCAN_DEPTH = 4
+for _dir in [Path(d) for d in _SEARCH if d]:
+    if (_dir / "mfdep" / "__init__.py").is_file():
+        sys.path.insert(0, str(_dir))
+        if _dir.name == "network_drive":
+            # So ``from network_drive import DB_DIR`` below still resolves.
+            sys.path.insert(0, str(_dir.parent))
+        # Drop a shim that got imported first; otherwise the path edit is moot.
+        for _name in [n for n in sys.modules
+                      if n == "mfdep" or n.startswith("mfdep.")]:
+            del sys.modules[_name]
+        break
 
-
-def _candidate_dirs(start: Path):
-    """Directories that could hold ``mfdep/``, nearest first.
-
-    Deliberately does not hard-code the tracer checkout's directory name - it
-    is spelled differently on different machines - and matches on the
-    ``src/network_drive`` shape instead.
-    """
-    for depth, parent in enumerate(start.parents):
-        yield parent                                  # <dir>/mfdep/
-        yield parent / "network_drive"                # <dir>/network_drive/mfdep/
-        if depth < _SIBLING_SCAN_DEPTH:
-            try:                                      # <sibling>/src/network_drive/mfdep/
-                siblings = sorted(parent.glob("*/src/network_drive"))
-            except OSError:                           # unreadable dir on the way up
-                siblings = []
-            for network_drive in siblings:
-                yield network_drive
-
-
-def _put_on_path(pkg_parent: Path) -> None:
-    """Add the directory that holds ``mfdep/`` to ``sys.path``.
-
-    When that directory is the network_drive package itself, its parent goes on
-    too, so ``from network_drive import DB_DIR`` keeps working alongside the
-    bare ``import mfdep``.
-    """
-    sys.path.insert(0, str(pkg_parent))
-    if pkg_parent.name == "network_drive":
-        sys.path.insert(0, str(pkg_parent.parent))
-    importlib.invalidate_caches()
-
-
-def _real_mfdep_importable() -> bool:
-    """True only if a plain ``import mfdep`` lands on a *usable* package.
-
-    Import success alone is not enough: the tracer installs a top-level
-    ``mfdep`` shim at ``src/mfdep/__init__.py`` that re-exports ``__version__``
-    and nothing else, so a bare import succeeds and ``mfdep.query`` is missing.
-    Accepting it defers the failure to the first lookup at run time, which is a
-    far worse place to discover it than at import.
-    """
-    try:
-        import mfdep  # noqa: F401
-    except ImportError:
-        return False
-    return all(hasattr(mfdep, attr) for attr in _REQUIRED_ATTRS)
-
-
-def _forget_mfdep() -> None:
-    """Drop a shim from ``sys.modules`` so the search result imports cleanly.
-
-    Without this, putting the real package on ``sys.path`` changes nothing:
-    ``import mfdep`` returns the already-cached shim rather than re-resolving.
-    """
-    for name in [n for n in sys.modules
-                 if n == "mfdep" or n.startswith("mfdep.")]:
-        del sys.modules[name]
-
-
-def _ensure_src_on_path() -> None:
-    """Make ``import mfdep`` work straight from a download, with no install.
-
-    Tries a normal import first, so a pip-installed mfdep (or an already
-    configured path) wins and this does nothing - but only if that import is
-    the real package and not a version shim, see ``_real_mfdep_importable``.
-    Otherwise it looks for a vendored copy, in the three layouts that occur in
-    practice. At each level going up from this file:
-
-      * ``<dir>/mfdep/`` - the package sits at the root beside the template,
-        which is the local test checkout.
-      * ``<dir>/network_drive/mfdep/`` - the work layout, where mfdep ships
-        inside the network_drive package. This is the one that matches when the
-        template has been copied to ``src/tracer_agent/`` at work.
-      * ``<sibling>/src/network_drive/mfdep/`` - a tracer checkout sitting
-        beside this repo rather than above it. Walking up alone never finds
-        this, because it is a sibling branch of the tree, not an ancestor.
-
-    The nearest match wins, so a local copy takes precedence over a sibling
-    checkout. ``$MFDEP_HOME``, if set to the directory containing ``mfdep/``,
-    overrides the search entirely - the escape hatch for a layout none of the
-    three cover.
-    """
-    if _real_mfdep_importable():
-        return
-    # A shim answered the import. Forget it, or the search below is pointless.
-    _forget_mfdep()
-
-    override = os.environ.get("MFDEP_HOME")
-    if override:
-        candidates = itertools.chain([Path(override)],
-                                     _candidate_dirs(Path(__file__).resolve()))
-    else:
-        candidates = _candidate_dirs(Path(__file__).resolve())
-
-    for candidate in candidates:
-        if not (candidate / "mfdep" / "__init__.py").is_file():
-            continue
-        _put_on_path(candidate.resolve())
-        _forget_mfdep()
-        if _real_mfdep_importable():
-            return
-        # Present but does not meet the interface. Keep looking; the path entry
-        # stays, harmlessly, since a later match is inserted ahead of it.
-        _forget_mfdep()
-    # Nothing usable found; the import below raises a clear ImportError.
-
-
-_ensure_src_on_path()
 
 import mfdep  # noqa: E402 - deliberately after the path bootstrap
 

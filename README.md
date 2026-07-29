@@ -25,28 +25,31 @@ tests/
 
 ## How mfdep is found
 
-Both the template and the test suite resolve mfdep the same way, so a layout
-that breaks the consumer breaks the tests too rather than passing by luck.
+Both the template and the test suite use the same short list of directories, in
+order. The first one containing `mfdep/` goes on the front of `sys.path`:
 
-An ordinary `import mfdep` is tried first, so anything already installed or
-already on the path wins and no bootstrapping happens. Only when that fails does
-the search run, checking each directory from the file's own location upward:
+| # | Directory | Why |
+| --- | --- | --- |
+| 1 | `$MFDEP_HOME` | explicit override, wins over everything |
+| 2 | `../mainframe-tracer/src/network_drive` | where the package actually lives |
+| 3 | `./mfdep` | local testing copy, gitignored |
 
-| Layout | Where it applies |
-| --- | --- |
-| `<dir>/mfdep/` | a local copy sitting beside the template |
-| `<dir>/network_drive/mfdep/` | the tracer at work, once the template has been copied to `src/tracer_agent/` |
-| `<sibling>/src/network_drive/mfdep/` | a tracer checkout beside this repo rather than above it |
+The template's list differs only in that it also checks `../network_drive`
+relative to itself, because at work it has been copied into `src/tracer_agent/`
+and the package is one level up. When the chosen directory is `network_drive`,
+its parent goes on the path too, so `from network_drive import DB_DIR` keeps
+working.
 
-The nearest match wins. The third case matters because walking up the tree never
-reaches it on its own — a sibling checkout is a different branch of the tree, not
-an ancestor. It matches on the `src/network_drive` shape rather than the checkout's
-directory name, which is spelled differently on different machines
-(`mainframe_tracer`, `mainframe-tracer`, …); that scan is bounded to four levels
-up so it stays cheap on a synced or network-mounted profile.
+**This is a list, not a search.** Nothing walks the tree, globs for candidates,
+or infers a layout. If none of the three is right on a given machine, set
+`MFDEP_HOME` to the directory *containing* `mfdep/` — that is the only knob, and
+it is meant to be used rather than worked around. When nothing matches, the
+error names every directory that was tried.
 
-Set `MFDEP_HOME` to the directory *containing* `mfdep/` to override the search
-entirely, for any layout the three above don't cover.
+Going on the *front* of `sys.path` matters: it beats anything installed under
+the same name, including the version shim the tracer installs, which exports
+only `__version__`. A shim already imported is dropped from `sys.modules` so the
+path change takes effect.
 
 ## Running the tests
 

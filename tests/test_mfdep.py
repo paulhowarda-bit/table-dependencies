@@ -740,7 +740,10 @@ class _ZeroInstallConsumerMixin:
                 "print(m.MFDEP_DB_PATH.replace(os.sep, '/'))\n"
                 "print(s['references'], len(s['jobs']))\n")
 
-        env = {k: v for k, v in os.environ.items() if k != "PYTHONPATH"}
+        # MFDEP_HOME as well as PYTHONPATH: this asserts the template locates
+        # the vendored copy on its own, and either would override that.
+        env = {k: v for k, v in os.environ.items()
+               if k not in ("PYTHONPATH", "MFDEP_HOME")}
         out = subprocess.check_output(
             [sys.executable, "-S", "-E", "run.py"],
             cwd=self.tmp, env=env, text=True).strip().splitlines()

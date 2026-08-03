@@ -49,10 +49,16 @@ for _dir in [Path(d) for d in _SEARCH if d]:
         if _dir.name == "network_drive":
             # So ``from network_drive import DB_DIR`` below still resolves.
             sys.path.insert(0, str(_dir.parent))
-        # Drop a shim that got imported first; otherwise the path edit is moot.
-        for _name in [n for n in sys.modules
-                      if n == "mfdep" or n.startswith("mfdep.")]:
-            del sys.modules[_name]
+        # Drop a shim that got imported first; otherwise the path edit is
+        # moot. But an mfdep already loaded from this very directory is left
+        # alone - re-importing it would orphan every object the host already
+        # holds (isinstance checks, multiprocessing pickling by identity).
+        _loaded = getattr(sys.modules.get("mfdep"), "__file__", None)
+        if _loaded is None or \
+                Path(_loaded).resolve() != (_dir / "mfdep" / "__init__.py").resolve():
+            for _name in [n for n in sys.modules
+                          if n == "mfdep" or n.startswith("mfdep.")]:
+                del sys.modules[_name]
         break
 
 

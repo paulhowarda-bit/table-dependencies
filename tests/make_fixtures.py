@@ -131,6 +131,28 @@ def build() -> None:
         (" ", "     STOP RUN."),
     ], ident="CUSTCON"))
 
+    # ---------------------------------------------------------- COBOL: cursor
+    # Field-level trap: the columns are named at DECLARE, but the host
+    # variables only appear at FETCH - pairing them is a cross-statement job.
+    write("PROD.COBOL.SRC/CUSTCUR", cob([
+        (" ", "IDENTIFICATION DIVISION."),
+        (" ", "PROGRAM-ID. CUSTCUR."),
+        (" ", "DATA DIVISION."),
+        (" ", "WORKING-STORAGE SECTION."),
+        (" ", "     COPY DCLCUST."),
+        (" ", "PROCEDURE DIVISION."),
+        (" ", "     EXEC SQL DECLARE C1 CURSOR FOR"),
+        (" ", "        SELECT CUST_ID, BALANCE"),
+        (" ", "          FROM PRODDB.CUSTOMER"),
+        (" ", "         WHERE BALANCE > 0"),
+        (" ", "         ORDER BY CUST_ID"),
+        (" ", "     END-EXEC."),
+        (" ", "     EXEC SQL OPEN C1 END-EXEC."),
+        (" ", "     EXEC SQL FETCH C1 INTO :CUST-ID, :BALANCE END-EXEC."),
+        (" ", "     EXEC SQL CLOSE C1 END-EXEC."),
+        (" ", "     STOP RUN."),
+    ], ident="CUSTCUR"))
+
     # ---------------------------------------------------------- PROC
     write("PROD.PROCLIB/CUSTPRC", """\
 //CUSTPRC  PROC DB2SYS=DB2P,PLANNM=CUSTPLAN

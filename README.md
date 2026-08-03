@@ -16,12 +16,33 @@ and lands in the using system inside the tracer's `network_drive` package:
 ```
 integration/
   table_dependencies.py   the template - copy to src/tracer_agent/ in the tracer
-  README.md               what the template is and how to wire it up
+  field_dependencies.py   field-level template - which COLUMNS each program
+                          touches, and which host variable each lands in
+  README.md               what the templates are and how to wire them up
 tests/
   conftest.py             resolves `import mfdep` before collection
   make_fixtures.py        generates a column-exact sample library
   test_mfdep.py           regression tests, one per failure mode
+  test_field_dependencies.py  the same, for the field-level template
 ```
+
+## Field-level dependencies
+
+`field_dependencies.py` answers the next question down: not "who touches
+`PRODDB.CUSTOMER`" but "who touches `BALANCE`, and where does it go". mfdep
+stays a table-level tool - the field template uses it **only to find the
+related files** (the referencing programs, the DCLGENs and copybooks, the DDL,
+the LOAD/UNLOAD decks) and then parses those files itself for:
+
+* column definitions from `CREATE TABLE` / DCLGEN `DECLARE TABLE`, in order
+* the DCLGEN binding: column ↔ COBOL host field ↔ PIC clause
+* per-statement column usage - SELECT/INTO pairing, `SET`, INSERT column
+  lists, VALUES pairing, WHERE/ON predicates, GROUP/ORDER BY, cursor
+  DECLARE→FETCH pairing, view and index definitions, LOAD/UNLOAD decks
+* where each host variable is defined (the program or a copybook it COPYs)
+
+It does **not** trace data flow past the SQL statement (no MOVE chains), and
+dynamic SQL / instream JCL SQL are reported as notes, never guessed.
 
 ## How mfdep is found
 
